@@ -1,5 +1,10 @@
-"""
-Система управления доступом и правами пользователей
+"""Пользователи бота и их права.
+
+Список пользователей хранится в config/users.json (в git не попадает — личные данные;
+шаблон — config/users.example.json). Формат:
+    {"users": [{"telegram_id": 123, "name": "Имя", "role": "admin|master",
+                "permissions": ["view_clients", "add_client", ...]}]}
+Бот отвечает только пользователям из этого файла. Изменения файла применяются после перезапуска бота.
 """
 import json
 import logging
@@ -9,21 +14,21 @@ logger = logging.getLogger(__name__)
 
 
 class AccessControl:
-    """Система управления правами доступа"""
+    """Проверка регистрации и прав пользователей по config/users.json."""
 
     def __init__(self, users_config_path: str):
-        """
-        Инициализация системы доступа
+        """Загружает пользователей из файла.
 
-        Args:
-            users_config_path: Путь к файлу конфигурации пользователей
+        Параметр: users_config_path — путь к users.json.
         """
         self.users_config_path = users_config_path
         self.users = {}
         self.load_users()
 
     def load_users(self):
-        """Загрузить конфигурацию пользователей из файла"""
+        """Читает users.json в словарь {telegram_id: данные}. При ошибке чтения пишет её в лог
+        (список пользователей остаётся пустым — бот никому не ответит).
+        """
         try:
             with open(self.users_config_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
@@ -37,24 +42,15 @@ class AccessControl:
             logger.error(f"Ошибка при загрузке конфигурации пользователей: {e}")
 
     def get_user(self, telegram_id: int) -> Optional[Dict]:
-        """Получить данные пользователя"""
+        """Возвращает данные пользователя (имя, роль, права) или None, если его нет в файле."""
         return self.users.get(telegram_id)
 
     def is_user_registered(self, telegram_id: int) -> bool:
-        """Проверить, зарегистрирован ли пользователь"""
+        """True, если Telegram ID есть в users.json."""
         return telegram_id in self.users
 
     def has_permission(self, telegram_id: int, permission: str) -> bool:
-        """
-        Проверить, есть ли у пользователя разрешение
-
-        Args:
-            telegram_id: ID пользователя Telegram
-            permission: Название разрешения
-
-        Returns:
-            True если есть разрешение
-        """
+        """True, если у пользователя есть указанное право (строка вроде 'add_car', см. PermissionChecker)."""
         user = self.get_user(telegram_id)
         if not user:
             return False
@@ -63,40 +59,33 @@ class AccessControl:
         return permission in permissions
 
     def get_user_permissions(self, telegram_id: int) -> List[str]:
-        """Получить список разрешений пользователя"""
+        """Возвращает список прав пользователя (пустой, если пользователя нет)."""
         user = self.get_user(telegram_id)
         if not user:
             return []
         return user.get('permissions', [])
 
     def get_user_role(self, telegram_id: int) -> Optional[str]:
-        """Получить роль пользователя"""
+        """Возвращает роль пользователя ('admin', 'master' …) или None."""
         user = self.get_user(telegram_id)
         if not user:
             return None
         return user.get('role')
 
     def is_admin(self, telegram_id: int) -> bool:
-        """Проверить, является ли пользователь администратором"""
+        """True, если роль пользователя 'admin'."""
         return self.get_user_role(telegram_id) == 'admin'
 
     def is_master(self, telegram_id: int) -> bool:
-        """Проверить, является ли пользователь мастером"""
+        """True, если роль пользователя 'master'."""
         return self.get_user_role(telegram_id) == 'master'
 
     def add_user(self, telegram_id: int, name: str, role: str,
                  permissions: List[str]) -> bool:
-        """
-        Добавить нового пользователя
+        """Добавляет (или заменяет) пользователя и сразу сохраняет users.json.
 
-        Args:
-            telegram_id: ID в Telegram
-            name: ФИО пользователя
-            role: Роль (admin, master, etc)
-            permissions: Список разрешений
-
-        Returns:
-            True если успешно
+        Параметры: telegram_id, name, role, permissions (список прав). Возвращает True/False.
+        В боте пока не вызывается из меню: используется при ручном администрировании.
         """
         try:
             self.users[telegram_id] = {
@@ -118,7 +107,7 @@ class AccessControl:
             return False
 
     def remove_user(self, telegram_id: int) -> bool:
-        """Удалить пользователя"""
+        """Удаляет пользователя и сохраняет users.json. Возвращает True, если пользователь был."""
         try:
             if telegram_id in self.users:
                 del self.users[telegram_id]
@@ -136,12 +125,16 @@ class AccessControl:
             return False
 
     def get_all_users(self) -> List[Dict]:
-        """Получить всех пользователей"""
+        """Возвращает список всех пользователей."""
         return list(self.users.values())
 
 
 class PermissionChecker:
-    """Вспомогательный класс для проверки разрешений"""
+    """Названия прав (константы) и их описания.
+
+    Используются в боте: VIEW_CLIENTS, ADD_CLIENT, ADD_CAR, VIEW_WORK. Остальные заведены на будущее
+    (редактирование/удаление, управление пользователями) и пока в меню не используются.
+    """
 
     # Константы разрешений
     VIEW_CLIENTS = "view_clients"
