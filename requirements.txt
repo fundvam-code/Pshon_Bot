@@ -1,5 +1,6 @@
-aiogram==3.3.0
-python-telegram-bot==20.5
+aiogram==3.2.0
+python-telegram-bot==20.3
 python-dotenv==1.0.0
 pywin32==307
 requests==2.31.0
+pydantic==2.4.2
