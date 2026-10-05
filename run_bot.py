@@ -4,6 +4,10 @@
 """
 import sys
 import os
+from dotenv import load_dotenv
+
+# Загружаем .env
+load_dotenv()
 
 # Добавляем src в path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))

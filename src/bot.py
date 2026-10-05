@@ -16,7 +16,7 @@ from one_c import OneC
 from access import AccessControl, PermissionChecker
 
 # Загрузим переменные окружения
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
 
 # Конфигурация логирования
 logging.basicConfig(
@@ -98,8 +98,10 @@ class AutoServiceBot:
         if not self.access.is_user_registered(user_id):
             await update.message.reply_text(
                 f"Привет, {user_name}! 👋\n\n"
-                f"К сожалению, вы не зарегистрированы в системе.\n"
-                f"Обратитесь к администратору для добавления."
+                f"К сожалению, вы не зарегистрированы в системе.\n\n"
+                f"📱 Твой Telegram ID:\n`{user_id}`\n\n"
+                f"Добавь этот ID в файл `config/users.json` и перезагрузи бота.\n\n"
+                f"Или используй команду /myid чтобы увидеть свой ID в любой момент."
             )
             return
 
@@ -114,6 +116,18 @@ class AutoServiceBot:
 
         logger.info(f"Пользователь {role_name} ({user_id}) начал работу")
         return MENU_STATE
+
+    async def myid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /myid - показать Telegram ID"""
+        user_id = update.effective_user.id
+        user_name = update.effective_user.first_name or "Пользователь"
+
+        await update.message.reply_text(
+            f"👤 Привет, {user_name}!\n\n"
+            f"Твой Telegram ID:\n`{user_id}`\n\n"
+            f"Используй этот ID в файле `config/users.json`"
+        )
+        logger.info(f"Пользователь {user_name} ({user_id}) запросил свой ID")
 
     async def handle_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик выбора пункта меню"""
@@ -312,6 +326,7 @@ class AutoServiceBot:
 
         # Добавляем обработчики
         app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("myid", self.myid))
 
         conv_handler = ConversationHandler(
             entry_points=[
