@@ -14,7 +14,9 @@ try:
     # Подключаемся к 1С
     connector = win32com.client.Dispatch("V83.COMConnector")
     db_path = os.getenv('ONE_C_DB_PATH', 'C:\\1C\\Pshon')
-    connection_string = f"File='{db_path}';"
+    user = os.getenv('ONE_C_USER', '')
+    pwd = os.getenv('ONE_C_PASSWORD', '')
+    connection_string = f"File='{db_path}';Usr='{user}';Pwd='{pwd}';"
 
     print(f"Подключение к: {db_path}")
     connection = connector.Connect(connection_string)

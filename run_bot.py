@@ -1,25 +1,23 @@
-#!/usr/bin/env python3
-"""
-Главный скрипт для запуска бота
-"""
-import sys
+"""Запуск бота. COM-коннектор 1С 32-битный, поэтому бот работает только в 32-битном Python (.venv32)."""
 import os
-from dotenv import load_dotenv
+import struct
+import subprocess
+import sys
 
-# Загружаем .env
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PY32 = os.path.join(BASE_DIR, '.venv32', 'Scripts', 'python.exe')
 
-# Добавляем src в path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+if struct.calcsize('P') * 8 != 32:
+    if not os.path.exists(PY32):
+        sys.exit("Нужен 32-битный Python: создайте окружение .venv32 (см. README).")
+    sys.exit(subprocess.call([PY32, os.path.abspath(__file__)] + sys.argv[1:]))
 
-from bot import AutoServiceBot
+sys.path.insert(0, os.path.join(BASE_DIR, 'src'))
+
+from bot import AutoServiceBot  # noqa: E402
 
 if __name__ == '__main__':
     try:
-        bot = AutoServiceBot()
-        bot.run()
+        AutoServiceBot().run()
     except KeyboardInterrupt:
-        print("\n\nБот остановлен пользователем")
-    except Exception as e:
-        print(f"Ошибка: {e}")
-        sys.exit(1)
+        print("\nБот остановлен")
