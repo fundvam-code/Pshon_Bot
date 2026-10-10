@@ -20,9 +20,12 @@ if struct.calcsize('P') * 8 != 32:
 sys.path.insert(0, os.path.join(BASE_DIR, 'src'))
 
 from bot import AutoServiceBot  # noqa: E402
+from config import ConfigError  # noqa: E402
 
 if __name__ == '__main__':
     try:
         AutoServiceBot().run()
+    except ConfigError as e:
+        sys.exit(f"Ошибка настройки: {e}")
     except KeyboardInterrupt:
         print("\nБот остановлен")

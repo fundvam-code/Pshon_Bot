@@ -14,12 +14,13 @@
 """
 import datetime
 import logging
-import os
 import uuid
 from typing import Dict, List, Optional
 
 import pywintypes
 import win32com.client
+
+from config import quote_1c
 
 logger = logging.getLogger(__name__)
 
@@ -41,26 +42,39 @@ class OneC:
     в котором оно создано (бот работает в одном потоке asyncio, поэтому это соблюдается).
     При потере связи соединение сбрасывается (c = None) и переустанавливается при следующем вызове.
     """
-    def __init__(self, db_path: str, user: str = "", password: str = ""):
+    def __init__(self, connection: str, user: str = "", password: str = "",
+                 progid: str = "V83.COMConnector", description: str = "", currency: str = "",
+                 default_executor: str = ""):
         """Запоминает параметры подключения; само подключение не выполняется (см. connect).
 
         Параметры:
-            db_path: каталог файловой базы 1С (где лежит 1Cv8.1CD), например C:\\1C\\Pshon.
+            connection: часть строки соединения 1С без логина и пароля: File='<каталог базы>' для
+                файловой базы или Srvr='<сервер>';Ref='<база>' для серверной (собирается в
+                config.load_settings из настроек .env).
             user: имя пользователя 1С. Ему нужно право «Внешнее соединение».
             password: пароль пользователя 1С (может быть пустым).
+            progid: имя COM-коннектора (V83.COMConnector для платформы 8.3).
+            description: читаемое описание базы для логов.
+            currency: наименование валюты учёта для новых записей (пусто — определить автоматически).
+            default_executor: ФИО исполнителя по умолчанию (сотрудник с признаком «Исполнитель»), которого
+                бот ставит на работы в заказ-нарядах, созданных через бота.
         """
-        self.db_path = db_path
+        self.default_executor = default_executor
+        self.connection = connection
         self.user = user
         self.password = password
+        self.progid = progid
+        self.description = description or connection
+        self.currency_name = currency
         self.c = None
         self._currency = None
 
     # ---------- подключение ----------
 
     def connect(self) -> bool:
-        """Подключается к базе 1С через V83.COMConnector.
+        """Подключается к базе 1С через COM-коннектор (по умолчанию V83.COMConnector).
 
-        Строка соединения: File='<путь>';Usr='<пользователь>';Pwd='<пароль>';
+        Строка соединения: <File=… или Srvr=…;Ref=…>;Usr='<пользователь>';Pwd='<пароль>';
         (именно Usr/Pwd, а не User/Password). Первое подключение может занимать около 30 секунд.
 
         Возвращает True при успехе. При ошибке пишет её в лог, сбрасывает соединение и возвращает False
@@ -69,12 +83,12 @@ class OneC:
         «Внешнее соединение не разрешено для указанного пользователя».
         """
         try:
-            connector = win32com.client.Dispatch("V83.COMConnector")
+            connector = win32com.client.Dispatch(self.progid)
             self.c = connector.Connect(
-                f"File='{self.db_path}';Usr='{self.user}';Pwd='{self.password}';"
+                f"{self.connection};Usr={quote_1c(self.user)};Pwd={quote_1c(self.password)};"
             )
             self._currency = None
-            logger.info("Подключено к 1С: %s", self.db_path)
+            logger.info("Подключено к 1С: %s", self.description)
             return True
         except Exception as e:
             self.c = None
@@ -181,7 +195,7 @@ class OneC:
         Исключение: OneCError, если в базе нет ни одной подходящей валюты.
         """
         if self._currency is None:
-            cur = os.getenv("ONE_C_CURRENCY", "").strip()
+            cur = self.currency_name
             if cur:
                 sel = self._query(
                     "ВЫБРАТЬ ПЕРВЫЕ 1 Вл.Ссылка КАК Ссылка ИЗ Справочник.Валюты КАК Вл "
@@ -263,7 +277,9 @@ class OneC:
                     pass
                 cars.append({"ref": sel.Авто, "name": sel.Название, "vin": sel.Вин or "", "year": year})
             for car in cars:
-                car["gos_number"] = self._car_gos_number(car.pop("ref"))
+                ref = car.pop("ref")
+                car["id"] = self._ref_id(ref)
+                car["gos_number"] = self._car_gos_number(ref)
             return cars
         except pywintypes.com_error as e:
             self.c = None
@@ -406,9 +422,17 @@ class OneC:
             works = []
             while rows.Следующий():
                 works.append({"name": rows.Работа or "—", "hours": float(rows.Часы), "sum": float(rows.Сумма)})
+            mats = self._query(
+                "ВЫБРАТЬ М.Номенклатура.Наименование КАК Имя, М.Количество КАК Кол, "
+                "М.ЕдиницаИзмерения.Наименование КАК Ед "
+                "ИЗ Документ.ЗаказНаряд.МатериалыЗаказчика КАК М ГДЕ М.Ссылка = &Д УПОРЯДОЧИТЬ ПО М.НомерСтроки",
+                {"Д": ref})
+            materials = []
+            while mats.Следующий():
+                materials.append({"name": mats.Имя or "—", "qty": float(mats.Кол), "unit": mats.Ед or ""})
             return {"number": str(head.Номер).lstrip("0") or "0", "customer": head.Заказчик or "—",
                     "car": head.Авто or "—", "total": float(head.Итого), "currency": head.Валюта or "",
-                    "works": works}
+                    "works": works, "materials": materials}
         except pywintypes.com_error as e:
             self.c = None
             logger.error("Ошибка чтения работ ЗН: %s", e)
@@ -655,7 +679,8 @@ class OneC:
                           {"Н": "Без НДС"})
         return sel.Ссылка if sel.Следующий() else self.c.Справочники.СтавкиНДС.ПустаяСсылка()
 
-    def add_work_to_order(self, order_id: str, hours: float, work_id: str = "", new_work_name: str = "") -> Dict:
+    def add_work_to_order(self, order_id: str, hours: float, work_id: str = "", new_work_name: str = "",
+                          assign_executor: bool = False) -> Dict:
         """Добавляет работу в заказ-наряд «В работе» и при необходимости создаёт её в справочнике.
 
         Параметры:
@@ -669,8 +694,11 @@ class OneC:
         (РежимЗаписиДокумента.Проведение), итоги пересчитывает сама 1С.
 
         Всё выполняется в одной транзакции: при ошибке не остаётся ни новой работы, ни изменений в ЗН.
+        Если assign_executor=True, на работу ставится исполнитель по умолчанию (default_executor):
+        строка в таблице «Исполнители» ЗН с процентом 100 и цехом сотрудника.
+
         Возвращает {"created_work": bool, "work": название, "total": новая сумма работ ЗН,
-        "line_sum": сумма добавленной строки}.
+        "line_sum": сумма добавленной строки, "executor": ФИО исполнителя или ""}.
         Исключение: OneCError (работа уже в ЗН, ЗН не «В работе», отказ 1С при записи/проведении).
         """
         self._ensure()
@@ -701,7 +729,8 @@ class OneC:
                 amount = round(hours * price, 2)
                 row = doc.Работы.Добавить()
                 row.Работа = work_ref
-                row.ИдентификаторРаботы = str(uuid.uuid4())
+                work_uid = str(uuid.uuid4())
+                row.ИдентификаторРаботы = work_uid
                 row.Количество = hours
                 row.Нормочас = norm.Ссылка
                 row.Коэффициент = 1
@@ -712,6 +741,13 @@ class OneC:
                 row.СуммаВсего = amount
                 row.ПакетРабот = str(uuid.uuid4())
                 row.НомерПакета = 1
+                if assign_executor:
+                    executor = self._executor(self.default_executor)
+                    ex_row = doc.Исполнители.Добавить()
+                    ex_row.ИдентификаторРаботы = work_uid
+                    ex_row.Исполнитель = executor.Ссылка
+                    ex_row.Цех = executor.Цех
+                    ex_row.Процент = 100
                 try:
                     if doc.Проведен:
                         doc.Записать(self.c.РежимЗаписиДокумента.Проведение)
@@ -730,7 +766,206 @@ class OneC:
             logger.error("Ошибка добавления работы: %s", e)
             raise OneCError("Ошибка связи с 1С при добавлении работы.")
         return {"created_work": created, "work": self.c.String(work_ref),
-                "total": float(doc.СуммаРаботДокумента), "line_sum": amount}
+                "total": float(doc.СуммаРаботДокумента), "line_sum": amount,
+                "executor": self.default_executor if assign_executor else ""}
+
+    def _executor(self, full_name: str):
+        """Находит сотрудника-исполнителя по ФИО (справочник «Сотрудники», признак «Исполнитель») и
+        возвращает его объект (нужны ссылка и цех).
+
+        Исключение: OneCError, если имя не задано (ONE_C_DEFAULT_EXECUTOR в .env) или сотрудник не найден.
+        """
+        if not full_name:
+            raise OneCError("Не задан исполнитель по умолчанию (параметр ONE_C_DEFAULT_EXECUTOR в .env).")
+        ref = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 С.Ссылка КАК Ссылка ИЗ Справочник.Сотрудники КАК С "
+            "ГДЕ С.Наименование = &Н И С.Исполнитель И НЕ С.ПометкаУдаления И НЕ С.ФлагУволен", {"Н": full_name})
+        if ref is None:
+            raise OneCError(f"Исполнитель «{full_name}» не найден в 1С среди работающих исполнителей "
+                            f"(проверьте ONE_C_DEFAULT_EXECUTOR в .env).")
+        return ref.ПолучитьОбъект()
+
+    # Реквизиты шапки, которые новый заказ-наряд берёт из последнего существующего ЗН (образца):
+    # организация, подразделение, хоз. операция, валюта и курсы, типы цен, вид ремонта, цех, вид оплаты и т.п.
+    ORDER_COPY_FIELDS = (
+        "Организация", "ПодразделениеКомпании", "ХозОперация", "ВалютаДокумента", "КурсДокумента",
+        "КурсВалютыУпр", "ТипЦен", "ТипЦенРабот", "ВидРемонта", "Цех", "ВидОплаты",
+        "КурсВалютыВзаиморасчетов", "РегламентированныйУчет", "АвтоЗакрытиеСделок",
+        "ЗакрыватьЗаказыТолькоПоДанномуЗаказНаряду", "ИсполнителиДляВсехРабот")
+
+    def _client_contract(self, client_ref, template_contract):
+        """Возвращает договор взаиморасчётов клиента (основной), а если его нет, создаёт копию договора образца.
+
+        1С сама договор при создании клиента через COM не создаёт, а в ЗН он нужен. Копия берёт все
+        условия договора образца (вид, валюта, типы цен, вид оплаты…), владелец — клиент, «Основной» = Да.
+        Исключение: OneCError, если договора нет и образца для копирования тоже нет.
+        """
+        ref = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 Д.Ссылка КАК Ссылка ИЗ Справочник.ДоговорыВзаиморасчетов КАК Д "
+            "ГДЕ Д.Владелец = &К И НЕ Д.ПометкаУдаления УПОРЯДОЧИТЬ ПО Д.Основной УБЫВ", {"К": client_ref})
+        if ref is not None:
+            return ref
+        if template_contract.Пустая():
+            raise OneCError("У клиента нет договора взаиморасчётов, а в образце заказ-наряда договора нет.")
+        contract = template_contract.ПолучитьОбъект().Скопировать()
+        now = datetime.datetime.now()
+        contract.Владелец = client_ref
+        contract.Основной = True
+        contract.ДатаНачала = now
+        contract.ДатаСоздания = now
+        self._write(contract, "договор клиента")
+        logger.info("Создан договор взаиморасчётов для клиента %s", client_ref.Наименование)
+        return contract.Ссылка
+
+    def create_work_order(self, client_id: str = "", new_client: Optional[Dict] = None,
+                          car_id: str = "", new_car: Optional[Dict] = None) -> Dict:
+        """Создаёт заказ-наряд в состоянии «В работе»; при необходимости сначала клиента и автомобиль.
+
+        Параметры (клиент: одно из двух, машина: одно из двух):
+            client_id: идентификатор существующего клиента; либо
+            new_client: {"name": ФИО, "phone": телефон} — клиент будет создан.
+            car_id: идентификатор существующего автомобиля клиента; либо
+            new_car: {"brand", "model", "gos", "vin", "year"} — машина будет создана и привязана к клиенту.
+
+        Всё выполняется в одной транзакции: если что-то не принято 1С, не создаётся ни клиент, ни машина,
+        ни ЗН. Шапку ЗН (организация, подразделение, цены, валюта, курсы, вид ремонта, цех, вид оплаты) бот
+        берёт из последнего существующего ЗН; договор — основной договор клиента (при отсутствии создаётся
+        копия договора образца). Документ только записывается (Записать), а проведением занимается сама 1С:
+        в состоянии «В работе» она проводит документ при записи.
+
+        Возвращает {"id", "number", "customer", "car"}.
+        Исключение: OneCError (машина с таким госномером уже есть, нет образца ЗН, отказ 1С, нет связи).
+        """
+        self._ensure()
+        try:
+            self.c.НачатьТранзакцию()
+            try:
+                if new_client:
+                    client_id = self.add_client(new_client["name"], new_client.get("phone", ""))["id"]
+                client_ref = self._ref("Контрагенты", client_id)
+                if new_car:
+                    created = self.add_car(client_id, new_car["brand"], new_car["model"], new_car["gos"],
+                                           new_car.get("vin", ""), new_car.get("year", 0))
+                    if not created["created"]:
+                        raise OneCError(f"Машина с номером {new_car['gos']} уже есть в 1С ({created['name']}).")
+                    car_id = created["id"]
+                car_ref = self._ref("Автомобили", car_id)
+
+                template_ref = self._first(
+                    "ВЫБРАТЬ ПЕРВЫЕ 1 Д.Ссылка КАК Ссылка ИЗ Документ.ЗаказНаряд КАК Д "
+                    "ГДЕ НЕ Д.ПометкаУдаления УПОРЯДОЧИТЬ ПО Д.Дата УБЫВ")
+                if template_ref is None:
+                    raise OneCError("В 1С нет ни одного заказ-наряда. Создайте один ЗН вручную: бот берёт из "
+                                    "последнего ЗН организацию, цены, валюту и другие настройки.")
+                template = template_ref.ПолучитьОбъект()
+                state = self._first(
+                    "ВЫБРАТЬ ПЕРВЫЕ 1 С.Ссылка КАК Ссылка ИЗ Справочник.ВидыСостоянийЗаказНарядов КАК С "
+                    "ГДЕ С.Наименование = &Н", {"Н": "В работе"})
+                if state is None:
+                    raise OneCError("В 1С не найдено состояние заказ-наряда «В работе».")
+
+                doc = self.c.Документы.ЗаказНаряд.СоздатьДокумент()
+                now = datetime.datetime.now()
+                doc.Дата = now
+                for field in self.ORDER_COPY_FIELDS:
+                    setattr(doc, field, getattr(template, field))
+                doc.Заказчик = client_ref
+                doc.Контрагент = client_ref
+                doc.Автомобиль = car_ref
+                doc.ДоговорВзаиморасчетов = self._client_contract(client_ref, template.ДоговорВзаиморасчетов)
+                doc.Состояние = state
+                doc.Автор = template.Автор
+                doc.ДатаМашинозаезда = now
+                doc.ДатаСоздания = now
+                doc.ДатаНачала = now
+                try:
+                    doc.Записать()
+                except pywintypes.com_error as e:
+                    detail = self._messages()
+                    logger.error("ЗН не создан: %s | %s", e, detail)
+                    raise OneCError(f"1С не приняла заказ-наряд: {detail or 'ошибка записи'}")
+                self.c.ЗафиксироватьТранзакцию()
+            except Exception:
+                if self.c is not None:
+                    self.c.ОтменитьТранзакцию()
+                raise
+        except pywintypes.com_error as e:
+            self.c = None
+            logger.error("Ошибка создания заказ-наряда: %s", e)
+            raise OneCError("Ошибка связи с 1С при создании заказ-наряда.")
+        number = str(doc.Номер).lstrip("0") or "0"
+        logger.info("Создан заказ-наряд №%s", number)
+        return {"id": self._ref_id(doc.Ссылка), "number": number,
+                "customer": client_ref.Наименование, "car": car_ref.Наименование}
+
+    def add_customer_part_to_order(self, order_id: str, qty: float, part_id: str = "",
+                                   new_part_name: str = "") -> Dict:
+        """Добавляет запчасть клиента (вкладка «Материалы заказчика») в заказ-наряд «В работе».
+
+        Параметры:
+            order_id: идентификатор ЗН. qty: количество (> 0).
+            part_id: идентификатор существующей номенклатуры (запчасти); либо
+            new_part_name: название новой запчасти (создаётся в «Номенклатуре», группа
+                «Запчасти для разнесения», как в add_part).
+
+        Единица измерения и коэффициент берутся из карточки запчасти. Если такая запчасть уже есть в
+        материалах заказчика этого ЗН, количество увеличивается в существующей строке. Проведённый
+        документ перепроводится. Всё выполняется в одной транзакции: при ошибке ничего не остаётся.
+
+        Возвращает {"created_part": bool, "part": название, "qty": добавленное количество,
+        "total_qty": количество в строке ЗН после добавления, "unit": единица}.
+        Исключение: OneCError (ЗН не «В работе», отказ 1С при записи/проведении, нет связи).
+        """
+        self._ensure()
+        if not part_id and not new_part_name:
+            raise OneCError("Не указана запчасть.")
+        try:
+            self.c.НачатьТранзакцию()
+            try:
+                created = not part_id
+                if part_id:
+                    guid = self.c.NewObject("УникальныйИдентификатор", part_id)
+                    part_ref = self.c.Справочники.Номенклатура.ПолучитьСсылку(guid)
+                else:
+                    part_ref = self._create_part(new_part_name)
+                doc = self._order_ref(order_id).ПолучитьОбъект()
+                if self.c.String(doc.Состояние) != "В работе":
+                    raise OneCError("ЗН уже не в состоянии «В работе».")
+                part = part_ref.ПолучитьОбъект()
+                unit = part.ОсновнаяЕдиницаИзмерения
+                row = None
+                for i in range(doc.МатериалыЗаказчика.Количество()):
+                    candidate = doc.МатериалыЗаказчика.Получить(i)
+                    if self.c.XMLString(candidate.Номенклатура) == self.c.XMLString(part_ref):
+                        row = candidate
+                        break
+                if row is not None:
+                    row.Количество = float(row.Количество) + qty
+                else:
+                    row = doc.МатериалыЗаказчика.Добавить()
+                    row.Номенклатура = part_ref
+                    row.Количество = qty
+                    row.ЕдиницаИзмерения = unit
+                    row.Коэффициент = float(unit.Коэффициент) if not unit.Пустая() and float(unit.Коэффициент) else 1
+                try:
+                    if doc.Проведен:
+                        doc.Записать(self.c.РежимЗаписиДокумента.Проведение)
+                    else:
+                        doc.Записать()
+                except pywintypes.com_error as e:
+                    detail = self._messages()
+                    logger.error("ЗН не записан: %s | %s", e, detail)
+                    raise OneCError(f"1С не приняла изменение ЗН: {detail or 'ошибка записи'}")
+                self.c.ЗафиксироватьТранзакцию()
+            except Exception:
+                self.c.ОтменитьТранзакцию()
+                raise
+        except pywintypes.com_error as e:
+            self.c = None
+            logger.error("Ошибка добавления запчасти клиента: %s", e)
+            raise OneCError("Ошибка связи с 1С при добавлении запчасти клиента.")
+        return {"created_part": created, "part": part.Наименование, "qty": qty,
+                "total_qty": float(row.Количество), "unit": self.c.String(row.ЕдиницаИзмерения)}
 
     # ---------- запись ----------
 
@@ -830,7 +1065,7 @@ class OneC:
             logger.error("Ошибка добавления автомобиля: %s", e)
             raise OneCError("Ошибка связи с 1С при добавлении автомобиля.")
         logger.info("Добавлен автомобиль: %s %s", model_name, gos_number)
-        return {"created": True, "name": car.Наименование}
+        return {"created": True, "name": car.Наименование, "id": self._ref_id(car.Ссылка)}
 
     def _find_or_create_model(self, model_name: str):
         """Находит модель автомобиля по наименованию или создаёт её (справочник «Модели»).

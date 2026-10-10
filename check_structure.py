@@ -1,62 +1,47 @@
 """Диагностика подключения к 1С.
 
-Подключается к базе из .env (ONE_C_DB_PATH, ONE_C_USER, ONE_C_PASSWORD) и выводит список
-справочников и документов. Запускать из 32-битного окружения:
+Подключается к базе по настройкам из .env (см. .env.example) и выводит список справочников и
+документов. Запускать из 32-битного окружения:
     .venv32/Scripts/python.exe check_structure.py
-Если список выведен — бот сможет работать с этой базой.
+Если список выведен — бот сможет работать с этой базой. При ошибке показывает причину
+(неверный путь, логин/пароль, нет права «Внешнее соединение», не зарегистрирован COM-коннектор).
 """
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+import sys
 
-from dotenv import load_dotenv
-load_dotenv()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
-try:
-    import win32com.client
+from config import ConfigError, load_settings  # noqa: E402
+from one_c import OneC  # noqa: E402
 
-    # Подключаемся к 1С
-    connector = win32com.client.Dispatch("V83.COMConnector")
-    db_path = os.getenv('ONE_C_DB_PATH', 'C:\\1C\\Pshon')
-    user = os.getenv('ONE_C_USER', '')
-    pwd = os.getenv('ONE_C_PASSWORD', '')
-    connection_string = f"File='{db_path}';Usr='{user}';Pwd='{pwd}';"
 
-    print(f"Подключение к: {db_path}")
-    connection = connector.Connect(connection_string)
-    print("✅ Подключено к 1С\n")
+def main() -> int:
+    """Подключается к 1С и печатает справочники и документы. Возвращает код завершения (0 — успех)."""
+    try:
+        s = load_settings()
+    except ConfigError as e:
+        print(f"Ошибка настройки: {e}")
+        return 2
 
-    # Получаем метаданные
-    metadata = connection.Metadata
+    print(f"Подключение: {s.one_c_description} (коннектор {s.one_c_progid}, пользователь «{s.one_c_user}»)")
+    one_c = OneC(s.one_c_connection, s.one_c_user, s.one_c_password,
+                 progid=s.one_c_progid, description=s.one_c_description)
+    if not one_c.connect():
+        print("Не удалось подключиться к 1С. Причина записана выше в логе; типичные причины описаны в README.")
+        return 1
+    print("Подключено к 1С\n")
 
-    print("=" * 60)
-    print("СПРАВОЧНИКИ В БАЗЕ 1С")
-    print("=" * 60)
+    meta = one_c.c.Метаданные
+    for title, collection in (("СПРАВОЧНИКИ", meta.Справочники), ("ДОКУМЕНТЫ", meta.Документы)):
+        print("=" * 60)
+        print(f"{title} В БАЗЕ 1С")
+        print("=" * 60)
+        for i, item in enumerate(collection, 1):
+            print(f"{i}. {item.Имя} ({item.Синоним})")
+        print()
+    print("Проверка завершена")
+    return 0
 
-    # Справочники
-    catalogs = metadata.Catalogs
-    print(f"\nВсего справочников: {catalogs.Count()}\n")
 
-    for i in range(catalogs.Count()):
-        catalog = catalogs.Get(i)
-        print(f"{i+1}. {catalog.Name} ({catalog.Synonym})")
-
-    print("\n" + "=" * 60)
-    print("ДОКУМЕНТЫ В БАЗЕ 1С")
-    print("=" * 60)
-
-    # Документы
-    documents = metadata.Documents
-    print(f"\nВсего документов: {documents.Count()}\n")
-
-    for i in range(documents.Count()):
-        doc = documents.Get(i)
-        print(f"{i+1}. {doc.Name} ({doc.Synonym})")
-
-    connection.Close()
-    print("\n✅ Проверка завершена")
-
-except Exception as e:
-    print(f"❌ Ошибка: {e}")
-    import traceback
-    traceback.print_exc()
+if __name__ == '__main__':
+    sys.exit(main())
