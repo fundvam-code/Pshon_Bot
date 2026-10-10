@@ -97,7 +97,7 @@ class OneC:
                 logger.error(
                     "COM-коннектор 1С создан, но метод Connect недоступен. Обычно это битая регистрация "
                     "comcntr.dll: в терминале ОТ АДМИНИСТРАТОРА выполните regsvr32 \"<каталог 1С>\\bin\\comcntr.dll\" "
-                    "для установленной версии платформы (32-битной) и удалите папку %%TEMP%%\\gen_py. "
+                    "для установленной версии платформы (32-битной) и удалите папку %TEMP%\\gen_py. "
                     "Подробности в README (раздел «Типовые ошибки»).")
             return False
 
@@ -799,11 +799,22 @@ class OneC:
         "КурсВалютыВзаиморасчетов", "РегламентированныйУчет", "АвтоЗакрытиеСделок",
         "ЗакрыватьЗаказыТолькоПоДанномуЗаказНаряду", "ИсполнителиДляВсехРабот")
 
-    def _client_contract(self, client_ref, template_contract):
+    def _payment_kind(self, template_order):
+        """Вид оплаты (перечисление «Виды оплаты») для новых договоров и ЗН: из образца ЗН, а если там пусто —
+        «Произвольная оплата»."""
+        value = template_order.ВидОплаты
+        if not value.Пустая():
+            return value
+        return self.c.Перечисления.ВидыОплаты.ПроизвольнаяОплата
+
+    def _client_contract(self, client_ref, template_contract, template_order=None):
         """Возвращает договор взаиморасчётов клиента (основной), а если его нет, создаёт копию договора образца.
 
         1С сама договор при создании клиента через COM не создаёт, а в ЗН он нужен. Копия берёт все
         условия договора образца (вид, валюта, типы цен, вид оплаты…), владелец — клиент, «Основной» = Да.
+        Наименование договора — «Договор б-н от ДД.ММ.ГГ» (дата регистрации клиента), номер договора «б-н».
+        Если в договоре образца какое-то обязательное поле пусто (бывает в других базах), оно добирается из
+        шапки образца ЗН (template_order): вид оплаты, организация, подразделение, тип цен, валюта.
         Исключение: OneCError, если договора нет и образца для копирования тоже нет.
         """
         ref = self._first(
@@ -819,6 +830,23 @@ class OneC:
         contract.Основной = True
         contract.ДатаНачала = now
         contract.ДатаСоздания = now
+        registered = now
+        try:
+            if client_ref.ДатаРегистрации.year > 1900:
+                registered = client_ref.ДатаРегистрации
+        except Exception:
+            pass
+        contract.Наименование = self._trim("ДоговорыВзаиморасчетов", f"Договор б-н от {registered:%d.%m.%y}")
+        contract.НомерДоговора = "б-н"
+        if template_order is not None:
+            fallbacks = (("ВидОплаты", self._payment_kind(template_order)),
+                         ("Организация", template_order.Организация),
+                         ("Подразделение", template_order.ПодразделениеКомпании),
+                         ("ТипЦенПродажи", template_order.ТипЦен),
+                         ("ВалютаВзаиморасчетов", template_order.ВалютаДокумента))
+            for field, value in fallbacks:
+                if getattr(contract, field).Пустая() and not value.Пустая():
+                    setattr(contract, field, value)
         self._write(contract, "договор клиента")
         logger.info("Создан договор взаиморасчётов для клиента %s", client_ref.Наименование)
         return contract.Ссылка
@@ -878,7 +906,9 @@ class OneC:
                 doc.Заказчик = client_ref
                 doc.Контрагент = client_ref
                 doc.Автомобиль = car_ref
-                doc.ДоговорВзаиморасчетов = self._client_contract(client_ref, template.ДоговорВзаиморасчетов)
+                doc.ДоговорВзаиморасчетов = self._client_contract(client_ref, template.ДоговорВзаиморасчетов, template)
+                if doc.ВидОплаты.Пустая():
+                    doc.ВидОплаты = self._payment_kind(template)
                 doc.Состояние = state
                 doc.Автор = template.Автор
                 doc.ДатаМашинозаезда = now
