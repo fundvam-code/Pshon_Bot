@@ -11,7 +11,7 @@
 
 Состояния диалога (ConversationHandler) — это только шаги, где бот ждёт ТЕКСТ или выбор из списка:
     MENU (навигация), SEARCH, CLIENT_NAME, CLIENT_PHONE, CAR_SEARCH, CAR_PICK, CAR_BRAND, CAR_MODEL,
-    CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_HOURS.
+    CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_AMOUNT.
 Кнопки обрабатываются в любом состоянии (on_callback → route), поэтому «Отмена» и переход в другое
 меню работают всегда.
 
@@ -21,7 +21,9 @@
     zn:<...>      выбор ЗН по номеру в списке или действие над выбранным ЗН (menu, info, works, add)
     wk:<n|new>    выбор похожей работы из списка или «добавить новую»
     cl:<n>        выбор клиента из нескольких найденных (при добавлении машины)
-    pt:<n|new>    выбор похожей запчасти клиента из списка или «добавить новую» (zn:addpart в ЗН)
+    pc:new|used   запчасть клиента в ЗН: новая или б/у (б/у — «запчасть б/у» в «Примечание печать»)
+    pt:<n|new>    запчасть клиента: выбор найденной по артикулу запчасти или «добавить новую»
+                  (порядок: новая/б/у → артикул → сверка по артикулу → наименование → количество)
     zc:<n|new>    при создании ЗН: выбор найденного клиента или «создать нового»
     zk:<n|new>    при создании ЗН: выбор машины клиента или «новая машина»
 
@@ -33,7 +35,11 @@
     x:cancel / x:skip / x:ok   «Отмена» (возврат на экран из user_data['back']), «Пропустить» /
                   «Без машины», «Подтвердить» (запись в 1С)
 
-Сценарий «Добавить клиента»: ФИО → телефон → экран с данными клиента → «Подтвердить» (клиент создаётся
+Тип клиента выбирается кнопкой в меню «Клиенты и машины» («Клиент: физ. лицо» / «Клиент: юр. лицо»; callback
+a:addclient:fl / a:addclient:ul) и в сценарии создания ЗН (zt:fl / zt:ul). Физлицо создаётся с формой
+собственности «Частное лицо», юрлицо — «Юридическое лицо».
+
+Сценарий «Добавить клиента»: ФИО (для юрлица — наименование организации) → телефон → экран с данными клиента → «Подтвердить» (клиент создаётся
 в 1С) → сразу ввод машины (марка, модель, госномер, VIN, год; на первом шаге есть «Без машины») →
 экран «Кому и какая машина» → «Подтвердить» (машина создаётся в 1С). До подтверждений в 1С ничего не пишется.
 То же добавление машины запускается из «Добавить машину» и из результата поиска клиента.
@@ -85,9 +91,10 @@ _wh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 works_log.addHandler(_wh)
 
 (MENU, SEARCH, CLIENT_NAME, CLIENT_PHONE, CAR_SEARCH, CAR_PICK, CAR_BRAND, CAR_MODEL,
- CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_HOURS,
+ CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_AMOUNT,
  CLIENT_CONFIRM, CAR_CONFIRM, CAT_NAME, CAT_CONFIRM, ZN_PART_NAME, ZN_PART_PICK, ZN_PART_QTY,
- ZN_NEW_CLIENT, ZN_NEW_PICK, ZN_NEW_NAME, ZN_NEW_PHONE, ZN_CAR_PICK, ZN_NEW_CONFIRM) = range(27)
+ ZN_NEW_CLIENT, ZN_NEW_PICK, ZN_NEW_NAME, ZN_NEW_PHONE, ZN_CAR_PICK, ZN_NEW_CONFIRM,
+ ZN_PART_COND, ZN_PART_ARTICLE, ZN_NEW_TYPE) = range(30)
 
 VIN_RE = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
 CANCEL = ("✖️ Отмена", "x:cancel")
@@ -97,7 +104,9 @@ OK = ("✅ Подтвердить", "x:ok")
 FLOW_KEYS = ('client_name', 'phone', 'client', 'candidates', 'brand', 'model', 'gos', 'vin', 'year',
              'after_client', 'cat', 'cat_name', 'work_id', 'work_name', 'new_work', 'new_work_candidate', 'work_options',
              'part_id', 'part_name', 'new_part', 'new_part_candidate', 'part_options',
-             'zn_flow', 'zn_query', 'zn_new_client', 'zn_car', 'client_cars', 'new_car')
+             'part_used', 'part_article', 'part_name_typed', 'new_part_article',
+             'zn_flow', 'zn_query', 'zn_new_client', 'zn_car', 'client_cars', 'new_car',
+             'client_legal', 'zn_legal')
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -129,9 +138,11 @@ class AutoServiceBot:
     # ---------- вывод ----------
 
     @staticmethod
-    def num(value: float) -> str:
-        """Форматирует число для вывода: разделитель тысяч — пробел, без лишних нулей (1250.5 → «1 250.5», 110.0 → «110»)."""
-        return f"{value:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
+    def num(value: float, digits: int = 2) -> str:
+        """Форматирует число для вывода: разделитель тысяч — пробел, без лишних нулей (1250.5 → «1 250.5», 110.0 → «110»).
+
+        digits — максимум знаков после запятой (для нормочасов 1С хранит 3)."""
+        return f"{value:,.{digits}f}".replace(",", " ").rstrip("0").rstrip(".")
 
     async def show(self, update: Update, text: str, markup=None, new: bool = False):
         """Показывает экран: правит текущее сообщение при нажатии кнопки, иначе отправляет новое.
@@ -219,7 +230,7 @@ class AutoServiceBot:
             if has(uid, P.VIEW_CLIENTS):
                 rows.append([("🔍 Найти клиента", "a:find")])
             if has(uid, P.ADD_CLIENT):
-                rows.append([("➕ Добавить клиента", "a:addclient")])
+                rows.append([("➕ Клиент: физ. лицо", "a:addclient:fl"), ("➕ Клиент: юр. лицо", "a:addclient:ul")])
             if has(uid, P.ADD_CAR):
                 rows.append([("➕ Добавить машину", "a:addcar")])
             rows.append([("⬅️ Назад", "m:refs")])
@@ -374,7 +385,8 @@ class AutoServiceBot:
 
         if data == "x:skip":
             step = {CLIENT_PHONE: self._client_phone, CAR_VIN: self._car_vin, CAR_YEAR: self._car_year,
-                    CAR_BRAND: self._skip_car, ZN_NEW_PHONE: self._zn_new_phone}.get(d.get('state'))
+                    CAR_BRAND: self._skip_car, ZN_NEW_PHONE: self._zn_new_phone,
+                    ZN_PART_ARTICLE: self._zn_part_article}.get(d.get('state'))
             if step:
                 return await step(update, context, "")
             return await self.route(update, context, "m:main")
@@ -395,9 +407,13 @@ class AutoServiceBot:
 
         if data == "a:find" and has(uid, P.VIEW_CLIENTS):
             return await self.ask(update, context, "Введите ФИО или телефон клиента:", kb([CANCEL]), SEARCH, "m:clients")
-        if data == "a:addclient" and has(uid, P.ADD_CLIENT):
-            return await self.ask(update, context, "Введите ФИО клиента (Фамилия Имя Отчество):", kb([CANCEL]),
-                                  CLIENT_NAME, "m:clients")
+        if data in ("a:addclient", "a:addclient:fl", "a:addclient:ul") and has(uid, P.ADD_CLIENT):
+            d['client_legal'] = data.endswith(":ul")
+            prompt = ("Введите наименование организации (например, ООО «Ромашка»):" if d['client_legal']
+                      else "Введите ФИО клиента (Фамилия Имя Отчество):")
+            return await self.ask(update, context, prompt, kb([CANCEL]), CLIENT_NAME, "m:clients")
+        if data in ("zt:fl", "zt:ul") and d.get('state') == ZN_NEW_TYPE:
+            return await self.zn_client_type(update, context, data == "zt:ul")
         if data == "a:addcar" and has(uid, P.ADD_CAR):
             return await self.ask(update, context, "Введите ФИО или телефон владельца машины:", kb([CANCEL]),
                                   CAR_SEARCH, "m:clients")
@@ -435,20 +451,22 @@ class AutoServiceBot:
 
         if data == "wk:new":
             d['new_work'] = d.pop('new_work_candidate', '')
-            return await self.ask_hours(update, context,
+            return await self.ask_amount(update, context,
                                         f"Работа «{d['new_work']}» будет добавлена в «Работы для разнесения».")
         if data.startswith("wk:"):
             options = d.get('work_options') or []
             idx = data[3:]
             if idx.isdigit() and int(idx) < len(options):
                 d['work_id'], d['work_name'] = options[int(idx)]['id'], options[int(idx)]['name']
-                return await self.ask_hours(update, context, f"Выбрана работа «{d['work_name']}».")
+                return await self.ask_amount(update, context, f"Выбрана работа «{d['work_name']}».")
             return await self.route(update, context, "m:main")
 
+        if data in ("pc:new", "pc:used") and d.get('state') == ZN_PART_COND:
+            d['part_used'] = data == "pc:used"
+            return await self.ask_part_article(update, context)
         if data == "pt:new":
-            d['new_part'] = d.pop('new_part_candidate', '')
-            return await self.ask_qty(update, context,
-                                      f"Запчасть «{d['new_part']}» будет добавлена в «Запчасти для разнесения».")
+            return await self.ask_part_article(
+                update, context, "Артикул должен быть уникальным: 1С не допускает два одинаковых артикула. ")
         if data.startswith("pt:"):
             options = d.get('part_options') or []
             idx = data[3:]
@@ -528,13 +546,14 @@ class AutoServiceBot:
             elif action == 'works':
                 body = "\n".join(f"{i}. {w['name']}" for i, w in enumerate(info['works'], 1))
             else:
-                body = "\n".join(f"{i}. {w['name']} — {self.num(w['hours'])} н/ч"
+                body = "\n".join(f"{i}. {w['name']} — {self.num(w['hours'], 3)} н/ч"
                                  for i, w in enumerate(info['works'], 1))
                 body += f"\n\nОбщая стоимость работ: {self.num(info['total'])} {info['currency']}".rstrip()
             if action == 'info':
                 if info['materials']:
                     body += "\n\n🧰 Запчасти клиента (материалы заказчика):\n" + "\n".join(
-                        f"{i}. {m['name']} — {self.num(m['qty'])} {m['unit']}".rstrip()
+                        (f"{i}. {m['name']} — {self.num(m['qty'])} {m['unit']}".rstrip()
+                         + (f" ({m['note']})" if m.get('note') else ""))
                         for i, m in enumerate(info['materials'], 1))
                 else:
                     body += "\n\n🧰 Запчастей клиента нет."
@@ -543,14 +562,23 @@ class AutoServiceBot:
         if action == 'add':
             return await self.ask(update, context, "Введите название работы:", kb([CANCEL]), ZN_WORK_NAME, "zn:menu")
         if action == 'addpart':
-            return await self.ask(update, context, "Введите название запчасти клиента:", kb([CANCEL]),
-                                  ZN_PART_NAME, "zn:menu")
+            return await self.ask(update, context, "Какая запчасть клиента?",
+                                  kb([("🆕 Новая", "pc:new"), ("♻️ Б/у", "pc:used")], [CANCEL]),
+                                  ZN_PART_COND, "zn:menu")
         return MENU
 
-    async def ask_hours(self, update, context, text: str):
-        """Спрашивает количество нормочасов для добавляемой работы (шаг после выбора/создания работы)."""
-        return await self.ask(update, context, text + "\nСколько нормочасов? (например, 1.5)", kb([CANCEL]),
-                              ZN_WORK_HOURS, "zn:menu")
+    async def ask_amount(self, update, context, text: str):
+        """Спрашивает сумму за добавляемую работу (шаг после выбора/создания работы).
+
+        В вопросе показывается действующий нормочас (цена из справочника «Нормочасы»): по нему бот переведёт
+        сумму в часы."""
+        try:
+            norm = self.one_c.get_norm_hour()
+            hint = f"\nДействующий нормочас: {self.num(norm['price'])} {norm['currency']}".rstrip()
+        except OneCError:
+            hint = ""
+        return await self.ask(update, context, f"{text}\nВведите сумму за работу (например, 165):{hint}",
+                              kb([CANCEL]), ZN_WORK_AMOUNT, "zn:menu")
 
     async def handle_zn_work_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Шаг «название работы»: ищет работу в справочнике.
@@ -571,10 +599,10 @@ class AutoServiceBot:
         d = context.user_data
         if found['exact']:
             d['work_id'], d['work_name'] = found['exact']['id'], found['exact']['name']
-            return await self.ask_hours(update, context, f"Работа найдена в справочнике: «{d['work_name']}».")
+            return await self.ask_amount(update, context, f"Работа найдена в справочнике: «{d['work_name']}».")
         if not found['similar']:
             d['new_work'] = name
-            return await self.ask_hours(
+            return await self.ask_amount(
                 update, context, f"Работы «{name}» нет в справочнике, будет добавлена в «Работы для разнесения».")
         d['work_options'] = found['similar']
         d['new_work_candidate'] = name
@@ -584,77 +612,134 @@ class AutoServiceBot:
         return await self.ask(update, context, "Точной работы нет, но есть похожие. Выберите или добавьте новую:",
                               kb(*rows), ZN_WORK_PICK, "zn:menu")
 
-    async def handle_zn_work_hours(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Шаг «нормочасы»: проверяет число (больше 0, не более 999; допускается запятая)
-        и добавляет работу в ЗН (OneC.add_work_to_order).
+    async def handle_zn_work_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «сумма за работу»: проверяет число (больше 0; допускается запятая) и добавляет работу в ЗН
+        (OneC.add_work_to_order): нормочасы вычисляются как сумма / цена действующего нормочаса, в таблицу
+        работ ЗН записываются эти часы и введённая сумма.
 
         При создании новой работы пишет запись в logs/added_works.log (кто, какая работа, в какой ЗН).
         Показывает результат и общую стоимость работ; ошибки 1С (дубль работы, ЗН уже не «В работе») — текстом.
         """
         await self.drop_prompt(context)
         try:
-            hours = float(update.message.text.strip().replace(",", "."))
+            amount = round(float(update.message.text.strip().replace(" ", "").replace(",", ".")), 2)
         except ValueError:
-            hours = 0
-        if not 0 < hours <= 999:
-            return await self.ask(update, context, "Введите число нормочасов больше 0, например 1.5:",
-                                  kb([CANCEL]), ZN_WORK_HOURS, "zn:menu")
+            amount = 0
+        if not 0 < amount <= 100000000:
+            return await self.ask(update, context, "Введите сумму больше 0, например 165:",
+                                  kb([CANCEL]), ZN_WORK_AMOUNT, "zn:menu")
         d = context.user_data
         order, user = d['order'], update.effective_user
         try:
             res = self.one_c.add_work_to_order(
-                order['id'], hours, work_id=d.get('work_id', ''), new_work_name=d.get('new_work', ''),
-                assign_executor=order.get('default_executor', False))
+                order['id'], 0, work_id=d.get('work_id', ''), new_work_name=d.get('new_work', ''),
+                assign_executor=order.get('default_executor', False), amount=amount)
         except OneCError as e:
             return await self.done_zn(update, context, f"❌ {e}")
         if res['created_work']:
             works_log.info("Пользователь %s (%s) добавил работу «%s» в справочник (группа «%s»), ЗН №%s",
                            self.access.get_user(user.id).get('name', ''), user.id, res['work'],
                            OneC.WORK_GROUP, order['number'])
-        logger.info("%s добавил в ЗН №%s работу «%s» %s н/ч", user.id, order['number'], res['work'], hours)
+        logger.info("%s добавил в ЗН №%s работу «%s»: %s н/ч (сумма %s)", user.id, order['number'], res['work'],
+                    res['hours'], amount)
         added = " (новая работа добавлена в справочник)" if res['created_work'] else ""
         executor = f"\nИсполнитель: {res['executor']}" if res.get('executor') else ""
         return await self.done_zn(
             update, context,
-            f"✅ В ЗН №{order['number']} добавлено: {res['work']} — {self.num(hours)} н/ч, "
-            f"{self.num(res['line_sum'])}{added}{executor}\nОбщая стоимость работ: {self.num(res['total'])}")
+            f"✅ В ЗН №{order['number']} добавлено: {res['work']} — {self.num(res['line_sum'])}, "
+            f"это {self.num(res['hours'], 3)} н/ч (нормочас {self.num(res['norm_price'])}){added}{executor}\n"
+            f"Общая стоимость работ: {self.num(res['total'])}")
 
     async def ask_qty(self, update, context, text: str):
         """Спрашивает количество запчастей клиента (шаг после выбора/создания запчасти)."""
         return await self.ask(update, context, text + "\nСколько штук? (например, 2)", kb([CANCEL]),
                               ZN_PART_QTY, "zn:menu")
 
-    async def handle_zn_part_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Шаг «название запчасти клиента»: ищет запчасть в справочнике «Номенклатура».
+    async def ask_part_article(self, update, context, head: str = ""):
+        """Спрашивает артикул запчасти клиента (шаг после выбора «новая / б/у»).
 
-        Точное совпадение — берёт её; нет точного, но есть похожие — показывает их кнопками плюс
-        «➕ Добавить новую»; совсем ничего нет — будет создана новая в группе «Запчасти для разнесения».
-        Дальше спрашивает количество.
+        Кнопка «Пропустить»: артикул будет создан автоматически из названия. Вызывается и повторно, когда
+        пользователь нажал «Добавить новую» при уже существующем артикуле: нужен другой, уникальный артикул.
+        """
+        context.user_data.pop('part_article', None)
+        text = (f"{head}Введите артикул запчасти.\n"
+                f"Если артикула нет, нажмите «Пропустить»: он будет создан автоматически из названия.")
+        return await self.ask(update, context, text, kb([SKIP, CANCEL]), ZN_PART_ARTICLE, "zn:menu")
+
+    async def handle_zn_part_article(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «артикул» (текстом): передаёт значение в _zn_part_article."""
+        return await self._zn_part_article(update, context, " ".join(update.message.text.split())[:50])
+
+    async def _zn_part_article(self, update, context, article: str):
+        """Принимает артикул (пустой — кнопка «Пропустить») и сверяет запчасть по артикулу, а не по названию.
+
+        Артикул уже есть в справочнике — показывает найденные запчасти (с названием) кнопками и «Добавить новую».
+        Артикула нет — спрашивает наименование (если оно уже известно, сразу переходит к количеству).
         """
         await self.drop_prompt(context)
-        name = " ".join(update.message.text.split())[:100]
+        d = context.user_data
+        d['part_article'] = article
+        if article:
+            try:
+                found = self.one_c.find_parts_by_article(article)
+            except OneCError as e:
+                return await self.done_zn(update, context, f"❌ {e}")
+            if found:
+                return await self.zn_part_options(update, context, found, f"Артикул «{article}» уже есть в справочнике.")
+            if d.get('part_name_typed'):
+                d['new_part'], d['new_part_article'] = d['part_name_typed'], article
+                return await self.ask_qty(
+                    update, context,
+                    f"Запчасть «{d['new_part']}» (артикул {article}) будет добавлена в «Запчасти для разнесения».")
+        elif d.get('part_name_typed'):
+            return await self._zn_part_name(update, context, d['part_name_typed'])
+        return await self.ask(update, context, "Введите наименование запчасти:", kb([CANCEL]), ZN_PART_NAME, "zn:menu")
+
+    async def zn_part_options(self, update, context, found, head: str):
+        """Показывает запчасти, найденные по артикулу: в кнопках название и артикул, плюс «➕ Добавить новую»."""
+        context.user_data['part_options'] = found
+        listing = "\n".join(f"• {p['name']} (артикул {p['article']})" for p in found)
+        rows = [[(f"{p['name']} · {p['article']}"[:60], f"pt:{i}")] for i, p in enumerate(found)]
+        rows.append([("➕ Добавить новую", "pt:new")])
+        rows.append([CANCEL])
+        return await self.ask(update, context, f"{head}\n{listing}\n\nВыберите запчасть или добавьте новую:",
+                              kb(*rows), ZN_PART_PICK, "zn:menu")
+
+    async def handle_zn_part_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «наименование запчасти» (текстом): передаёт значение в _zn_part_name."""
+        await self.drop_prompt(context)
+        return await self._zn_part_name(update, context, " ".join(update.message.text.split())[:100])
+
+    async def _zn_part_name(self, update, context, name: str):
+        """Принимает наименование новой запчасти.
+
+        Артикул был введён (и проверен как уникальный) — запчасть будет создана с ним. Артикула нет — он
+        формируется из названия (без пробелов, до 25 символов) и тоже сверяется со справочником: если такой
+        артикул уже есть, показываются найденные запчасти. Дальше — количество.
+        """
+        d = context.user_data
         if len(name) < 2:
-            return await self.ask(update, context, "Введите название запчасти (не короче 2 символов):",
+            return await self.ask(update, context, "Введите наименование запчасти (не короче 2 символов):",
                                   kb([CANCEL]), ZN_PART_NAME, "zn:menu")
+        d['part_name_typed'] = name
+        article = d.get('part_article', '')
+        if article:
+            d['new_part'], d['new_part_article'] = name, article
+            return await self.ask_qty(
+                update, context, f"Запчасть «{name}» (артикул {article}) будет добавлена в «Запчасти для разнесения».")
+        generated = "".join(name.split())[:25]
         try:
-            found = self.one_c.find_parts(name)
+            found = self.one_c.find_parts_by_article(generated)
         except OneCError as e:
             return await self.done_zn(update, context, f"❌ {e}")
-        d = context.user_data
-        if found['exact']:
-            d['part_id'], d['part_name'] = found['exact']['id'], found['exact']['name']
-            return await self.ask_qty(update, context, f"Запчасть найдена в справочнике: «{d['part_name']}».")
-        if not found['similar']:
-            d['new_part'] = name
-            return await self.ask_qty(
-                update, context, f"Запчасти «{name}» нет в справочнике, будет добавлена в «Запчасти для разнесения».")
-        d['part_options'] = found['similar']
-        d['new_part_candidate'] = name
-        rows = [[(w['name'], f"pt:{i}")] for i, w in enumerate(found['similar'])]
-        rows.append([(f"➕ Добавить новую: {name}", "pt:new")])
-        rows.append([CANCEL])
-        return await self.ask(update, context, "Точной запчасти нет, но есть похожие. Выберите или добавьте новую:",
-                              kb(*rows), ZN_PART_PICK, "zn:menu")
+        if found:
+            return await self.zn_part_options(
+                update, context, found, f"Артикул создаётся из названия («{generated}»), такой уже есть в справочнике.")
+        d['new_part'], d['new_part_article'] = name, ""
+        return await self.ask_qty(
+            update, context,
+            f"Запчасть «{name}» (артикул будет создан автоматически: {generated}) "
+            f"будет добавлена в «Запчасти для разнесения».")
 
     async def handle_zn_part_qty(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Шаг «количество»: проверяет число (больше 0, не более 9999; допускается запятая) и добавляет
@@ -675,7 +760,8 @@ class AutoServiceBot:
         order, user = d['order'], update.effective_user
         try:
             res = self.one_c.add_customer_part_to_order(
-                order['id'], qty, part_id=d.get('part_id', ''), new_part_name=d.get('new_part', ''))
+                order['id'], qty, part_id=d.get('part_id', ''), new_part_name=d.get('new_part', ''),
+                new_part_article=d.get('new_part_article', ''), used=d.get('part_used', False))
         except OneCError as e:
             return await self.done_zn(update, context, f"❌ {e}")
         if res['created_part']:
@@ -687,9 +773,12 @@ class AutoServiceBot:
         added = " (новая запчасть добавлена в справочник)" if res['created_part'] else ""
         total = (f"\nВсего этой запчасти в ЗН: {self.num(res['total_qty'])}{unit}"
                  if res['total_qty'] != qty else "")
+        kind = "б/у" if res['used'] else "новая"
+        article = f", артикул {res['article']}" if res['article'] else ""
         return await self.done_zn(
             update, context,
-            f"✅ В ЗН №{order['number']} добавлена запчасть клиента: {res['part']} — {self.num(qty)}{unit}{added}{total}")
+            f"✅ В ЗН №{order['number']} добавлена запчасть клиента ({kind}): {res['part']}{article} — "
+            f"{self.num(qty)}{unit}{added}{total}")
 
     # ---------- создание заказ-наряда ----------
 
@@ -729,26 +818,41 @@ class AutoServiceBot:
         (если введённый текст похож на ФИО, берётся он, иначе бот спросит ФИО)."""
         d = context.user_data
         if value == "new":
-            query = d.get('zn_query', '')
-            if re.search(r'[A-Za-zА-Яа-яЁё]', query):
-                d['zn_new_client'] = {"name": " ".join(query.split())[:100], "phone": ""}
-                return await self.ask(update, context, f"Новый клиент: {d['zn_new_client']['name']}\nТелефон клиента:",
-                                      kb([SKIP, CANCEL]), ZN_NEW_PHONE, "m:orders")
-            return await self.ask(update, context, "Введите ФИО нового клиента (Фамилия Имя Отчество):",
-                                  kb([CANCEL]), ZN_NEW_NAME, "m:orders")
+            return await self.ask(update, context, "Кого создать?",
+                                  kb([("👤 Физ. лицо", "zt:fl"), ("🏢 Юр. лицо", "zt:ul")], [CANCEL]),
+                                  ZN_NEW_TYPE, "m:orders")
         candidates = d.get('candidates') or []
         if value.isdigit() and int(value) < len(candidates):
             return await self.zn_pick_client(update, context, candidates[int(value)])
         return await self.route(update, context, "m:orders")
 
+    async def zn_client_type(self, update, context, legal: bool):
+        """Тип нового клиента при создании ЗН (кнопки «Физ. лицо» / «Юр. лицо»).
+
+        Если введённый для поиска текст похож на ФИО или название (есть буквы), он берётся как имя клиента и
+        бот сразу спрашивает телефон; иначе (например, искали по номеру телефона) спрашивает ФИО/наименование.
+        """
+        d = context.user_data
+        d['zn_legal'] = legal
+        query = d.get('zn_query', '')
+        if re.search(r'[A-Za-zА-Яа-яЁё]', query):
+            d['zn_new_client'] = {"name": " ".join(query.split())[:100], "phone": "", "legal": legal}
+            return await self.ask(update, context, f"Новый клиент: {d['zn_new_client']['name']}\nТелефон клиента:",
+                                  kb([SKIP, CANCEL]), ZN_NEW_PHONE, "m:orders")
+        prompt = ("Введите наименование организации (например, ООО «Ромашка»):" if legal
+                  else "Введите ФИО нового клиента (Фамилия Имя Отчество):")
+        return await self.ask(update, context, prompt, kb([CANCEL]), ZN_NEW_NAME, "m:orders")
+
     async def handle_zn_new_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Шаг «ФИО нового клиента» при создании ЗН: проверяет длину и спрашивает телефон."""
+        """Шаг «ФИО нового клиента» (для юрлица — наименование) при создании ЗН: проверяет длину и
+        спрашивает телефон."""
         await self.drop_prompt(context)
         name = " ".join(update.message.text.split())
         if len(name) < 2 or len(name) > 100:
-            return await self.ask(update, context, "Введите ФИО (от 2 до 100 символов):",
+            what = "наименование организации" if context.user_data.get('zn_legal') else "ФИО"
+            return await self.ask(update, context, f"Введите {what} (от 2 до 100 символов):",
                                   kb([CANCEL]), ZN_NEW_NAME, "m:orders")
-        context.user_data['zn_new_client'] = {"name": name, "phone": ""}
+        context.user_data['zn_new_client'] = {"name": name, "phone": "", "legal": context.user_data.get('zn_legal', False)}
         return await self.ask(update, context, f"Новый клиент: {name}\nТелефон клиента:",
                               kb([SKIP, CANCEL]), ZN_NEW_PHONE, "m:orders")
 
@@ -804,7 +908,9 @@ class AutoServiceBot:
         d = context.user_data
         new_client, client = d.get('zn_new_client'), d.get('client')
         if new_client:
-            who = f"{new_client['name']} (новый клиент" + (f", {new_client['phone']}" if new_client['phone'] else "") + ")"
+            kind = "юр. лицо" if new_client.get('legal') else "физ. лицо"
+            who = (f"{new_client['name']} (новый клиент, {kind}"
+                   + (f", {new_client['phone']}" if new_client['phone'] else "") + ")")
         else:
             who = client['name']
         new_car = d.get('new_car')
@@ -891,11 +997,13 @@ class AutoServiceBot:
     # ---------- добавление клиента ----------
 
     async def handle_client_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Шаг «ФИО клиента»: проверяет длину (2–100 символов) и спрашивает телефон."""
+        """Шаг «ФИО клиента» (для юрлица — наименование организации): проверяет длину (2–100 символов)
+        и спрашивает телефон. Тип клиента (физ. / юр. лицо) выбран кнопкой в меню (user_data['client_legal'])."""
         await self.drop_prompt(context)
         name = " ".join(update.message.text.split())
         if len(name) < 2 or len(name) > 100:
-            return await self.ask(update, context, "Введите ФИО (от 2 до 100 символов):",
+            what = "наименование организации" if context.user_data.get('client_legal') else "ФИО"
+            return await self.ask(update, context, f"Введите {what} (от 2 до 100 символов):",
                                   kb([CANCEL]), CLIENT_NAME, "m:clients")
         context.user_data['client_name'] = name
         return await self.ask(update, context, "Телефон клиента:", kb([SKIP, CANCEL]), CLIENT_PHONE, "m:clients")
@@ -913,7 +1021,8 @@ class AutoServiceBot:
         await self.drop_prompt(context)
         d = context.user_data
         d['phone'] = phone[:50]
-        text = (f"Проверьте данные нового клиента:\n\n👤 {d['client_name']}\n"
+        kind = "юридическое лицо" if d.get('client_legal') else "физическое лицо"
+        text = (f"Проверьте данные нового клиента:\n\n{'🏢' if d.get('client_legal') else '👤'} {d['client_name']} ({kind})\n"
                 f"☎️ {d['phone'] or 'телефон не указан'}\n\nСоздать клиента в 1С?")
         return await self.ask(update, context, text, kb([OK, CANCEL]), CLIENT_CONFIRM, "m:clients")
 
@@ -925,7 +1034,7 @@ class AutoServiceBot:
         """
         d = context.user_data
         try:
-            res = self.one_c.add_client(d['client_name'], d['phone'])
+            res = self.one_c.add_client(d['client_name'], d['phone'], legal=d.get('client_legal', False))
         except OneCError as e:
             await self.drop_prompt(context)
             return await self.done(update, context, f"❌ {e}")
@@ -935,7 +1044,7 @@ class AutoServiceBot:
         else:
             head = f"Клиент «{res['name']}» уже есть в 1С."
         client = {"id": res["id"], "name": res["name"], "phone": res["phone"]}
-        for key in ('client_name', 'phone'):
+        for key in ('client_name', 'phone', 'client_legal'):
             d.pop(key, None)
         return await self.choose_client(update, context, client, head=head, optional=True)
 
@@ -1190,15 +1299,18 @@ class AutoServiceBot:
                 CAR_YEAR: st(self.handle_car_year),
                 ZN_WORK_NAME: st(self.handle_zn_work_name),
                 ZN_WORK_PICK: st(self.pick_by_button),
-                ZN_WORK_HOURS: st(self.handle_zn_work_hours),
+                ZN_WORK_AMOUNT: st(self.handle_zn_work_amount),
                 CLIENT_CONFIRM: st(self.pick_by_button),
                 CAR_CONFIRM: st(self.pick_by_button),
                 ZN_NEW_CLIENT: st(self.handle_zn_new_client),
                 ZN_NEW_PICK: st(self.pick_by_button),
+                ZN_NEW_TYPE: st(self.pick_by_button),
                 ZN_NEW_NAME: st(self.handle_zn_new_name),
                 ZN_NEW_PHONE: st(self.handle_zn_new_phone),
                 ZN_CAR_PICK: st(self.pick_by_button),
                 ZN_NEW_CONFIRM: st(self.pick_by_button),
+                ZN_PART_COND: st(self.pick_by_button),
+                ZN_PART_ARTICLE: st(self.handle_zn_part_article),
                 ZN_PART_NAME: st(self.handle_zn_part_name),
                 ZN_PART_PICK: st(self.pick_by_button),
                 ZN_PART_QTY: st(self.handle_zn_part_qty),

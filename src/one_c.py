@@ -14,6 +14,7 @@
 """
 import datetime
 import logging
+import re
 import uuid
 from typing import Dict, List, Optional
 
@@ -235,14 +236,16 @@ class OneC:
         self._ensure()
         escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("[", "\\[")
         pattern = f"%{escaped}%"
+        digits = re.sub(r"\D", "", text)
+        phone_pattern = f"%{digits}%" if digits and re.fullmatch(r"[\d\s+()\-]+", text.strip()) else pattern
         try:
             sel = self._query(
                 "ВЫБРАТЬ ПЕРВЫЕ " + str(SEARCH_LIMIT) + " К.Ссылка КАК Ссылка, К.Наименование КАК Имя, "
                 "К.ОсновнойТелефон КАК Телефон ИЗ Справочник.Контрагенты КАК К "
                 "ГДЕ НЕ К.ЭтоГруппа И НЕ К.ПометкаУдаления "
-                "И (К.Наименование ПОДОБНО &Т СПЕЦСИМВОЛ \"\\\" ИЛИ К.ОсновнойТелефон ПОДОБНО &Т СПЕЦСИМВОЛ \"\\\") "
+                "И (К.Наименование ПОДОБНО &Т СПЕЦСИМВОЛ \"\\\" ИЛИ К.ОсновнойТелефон ПОДОБНО &Ф СПЕЦСИМВОЛ \"\\\") "
                 "УПОРЯДОЧИТЬ ПО К.Наименование",
-                {"Т": pattern})
+                {"Т": pattern, "Ф": phone_pattern})
             result = []
             while sel.Следующий():
                 result.append({"id": self._ref_id(sel.Ссылка), "name": sel.Имя, "phone": sel.Телефон or ""})
@@ -430,12 +433,13 @@ class OneC:
                 works.append({"name": rows.Работа or "—", "hours": float(rows.Часы), "sum": float(rows.Сумма)})
             mats = self._query(
                 "ВЫБРАТЬ М.Номенклатура.Наименование КАК Имя, М.Количество КАК Кол, "
-                "М.ЕдиницаИзмерения.Наименование КАК Ед "
+                "М.ЕдиницаИзмерения.Наименование КАК Ед, М.ПримечаниеНоменклатураПечать КАК Прим "
                 "ИЗ Документ.ЗаказНаряд.МатериалыЗаказчика КАК М ГДЕ М.Ссылка = &Д УПОРЯДОЧИТЬ ПО М.НомерСтроки",
                 {"Д": ref})
             materials = []
             while mats.Следующий():
-                materials.append({"name": mats.Имя or "—", "qty": float(mats.Кол), "unit": mats.Ед or ""})
+                materials.append({"name": mats.Имя or "—", "qty": float(mats.Кол), "unit": mats.Ед or "",
+                                  "note": mats.Прим or ""})
             return {"number": str(head.Номер).lstrip("0") or "0", "customer": head.Заказчик or "—",
                     "car": head.Авто or "—", "total": float(head.Итого), "currency": head.Валюта or "",
                     "works": works, "materials": materials}
@@ -604,12 +608,54 @@ class OneC:
         logger.info("Создана группа номенклатуры «%s»", self.PARTS_GROUP)
         return group.Ссылка
 
-    def _create_part(self, name: str):
+    @staticmethod
+    def normalize_article(article: str) -> str:
+        """Артикул для сравнения: без пробелов и в верхнем регистре (так 1С хранит «Артикул для поиска»)."""
+        return "".join(article.split()).upper()
+
+    def find_parts_by_article(self, article: str) -> List[Dict]:
+        """Ищет запчасти (товары) в справочнике «Номенклатура» по артикулу, а не по названию.
+
+        Артикул сравнивается точно, без учёта регистра и пробелов, и с полем «Артикул», и с «Артикулом для
+        поиска». Группы и помеченные на удаление не берутся. Возвращает до 8 записей
+        [{"id", "name", "article"}], пустой список, если артикула нет или он не задан.
+        Исключение: OneCError при ошибке поиска.
+        """
+        key = self.normalize_article(article)
+        if not key:
+            return []
+        self._ensure()
+        # 1С при записи сама пересчитывает «Артикул для поиска» (верхний регистр, пробелы остаются), поэтому
+        # кандидатов отбираем шаблоном «%А%Р%Т%…%» (символы артикула по порядку), а точное сравнение без
+        # пробелов и регистра делаем здесь.
+        pattern = "%" + "%".join(("\\" + ch) if ch in "\\%_[" else ch for ch in key) + "%"
+        try:
+            sel = self._query(
+                "ВЫБРАТЬ ПЕРВЫЕ 300 Н.Ссылка КАК Ссылка, Н.Наименование КАК Имя, Н.Артикул КАК Арт, "
+                "Н.АртикулДляПоиска КАК АртПоиск ИЗ Справочник.Номенклатура КАК Н "
+                "ГДЕ НЕ Н.ЭтоГруппа И НЕ Н.ПометкаУдаления "
+                "И Н.ВидНоменклатуры = ЗНАЧЕНИЕ(Перечисление.ВидыНоменклатуры.Товар) "
+                "И (Н.АртикулДляПоиска ПОДОБНО &П СПЕЦСИМВОЛ \"\\\" ИЛИ Н.Артикул ПОДОБНО &П СПЕЦСИМВОЛ \"\\\") "
+                "УПОРЯДОЧИТЬ ПО Н.Наименование", {"П": pattern})
+            result = []
+            while sel.Следующий():
+                if key in (self.normalize_article(sel.Арт or ""), self.normalize_article(sel.АртПоиск or "")):
+                    result.append({"id": self._ref_id(sel.Ссылка), "name": sel.Имя, "article": sel.Арт or ""})
+                    if len(result) == 8:
+                        break
+            return result
+        except pywintypes.com_error as e:
+            self.c = None
+            logger.error("Ошибка поиска запчасти по артикулу: %s", e)
+            raise OneCError("Ошибка поиска запчасти по артикулу в 1С.")
+
+    def _create_part(self, name: str, article: str = ""):
         """Создаёт запчасть в справочнике «Номенклатура» в группе «Запчасти для разнесения».
 
         Заполняется то, что требует 1С: тип «Штучный», вид «Товар», единица «шт», ставка НДС «Без НДС»,
-        валюта учёта, артикул (как у существующих позиций — название без пробелов) и артикул для поиска.
-        Вызывается внутри транзакции add_part.
+        валюта учёта, артикул и артикул для поиска. Артикул — заданный пользователем (article); если он
+        пуст, создаётся автоматически из названия (название без пробелов, как у существующих позиций).
+        Вызывается внутри транзакции add_part и add_customer_part_to_order.
         """
         item = self.c.Справочники.Номенклатура.СоздатьЭлемент()
         item.Родитель = self._parts_group()
@@ -634,9 +680,9 @@ class OneC:
             item.ОсновнаяЕдиницаИзмерения = main_unit
         item.СтавкаНДС = self._default_vat()
         item.ВалютаУчета = self._accounting_currency()
-        article = "".join(name.split())[:25]
+        article = " ".join(article.split()) or "".join(name.split())[:25]
         item.Артикул = article
-        item.АртикулДляПоиска = article.upper()
+        item.АртикулДляПоиска = self.normalize_article(article)
         self._write(item, "запчасть")
         return item.Ссылка
 
@@ -685,8 +731,27 @@ class OneC:
                           {"Н": "Без НДС"})
         return sel.Ссылка if sel.Следующий() else self.c.Справочники.СтавкиНДС.ПустаяСсылка()
 
+    def get_norm_hour(self) -> Dict:
+        """Действующий нормочас из справочника «Нормочасы»: {"price": цена нормочаса, "currency": валюта}.
+
+        Берётся первый не помеченный на удаление нормочас (так же, как при добавлении работы в ЗН).
+        Исключение: OneCError, если нормочаса нет или нет связи.
+        """
+        self._ensure()
+        try:
+            sel = self._query(
+                "ВЫБРАТЬ ПЕРВЫЕ 1 Н.Цена КАК Цена, Н.Валюта.Наименование КАК Валюта ИЗ Справочник.Нормочасы КАК Н "
+                "ГДЕ НЕ Н.ПометкаУдаления УПОРЯДОЧИТЬ ПО Н.Код")
+            if not sel.Следующий():
+                raise OneCError("В 1С не найден нормочас.")
+            return {"price": float(sel.Цена), "currency": sel.Валюта or ""}
+        except pywintypes.com_error as e:
+            self.c = None
+            logger.error("Ошибка чтения нормочаса: %s", e)
+            raise OneCError("Ошибка чтения нормочаса из 1С.")
+
     def add_work_to_order(self, order_id: str, hours: float, work_id: str = "", new_work_name: str = "",
-                          assign_executor: bool = False) -> Dict:
+                          assign_executor: bool = False, amount: Optional[float] = None) -> Dict:
         """Добавляет работу в заказ-наряд «В работе» и при необходимости создаёт её в справочнике.
 
         Параметры:
@@ -700,11 +765,16 @@ class OneC:
         (РежимЗаписиДокумента.Проведение), итоги пересчитывает сама 1С.
 
         Всё выполняется в одной транзакции: при ошибке не остаётся ни новой работы, ни изменений в ЗН.
+        Если задана amount (сумма за работу), количество нормочасов вычисляется как сумма / цена действующего
+        нормочаса (округление до 3 знаков, как хранит 1С), а в строку пишутся эти часы и сумма ровно в том
+        размере, как её ввели; параметр hours тогда игнорируется.
+
         Если assign_executor=True, на работу ставится исполнитель по умолчанию (default_executor):
         строка в таблице «Исполнители» ЗН с процентом 100 и цехом сотрудника.
 
         Возвращает {"created_work": bool, "work": название, "total": новая сумма работ ЗН,
-        "line_sum": сумма добавленной строки, "executor": ФИО исполнителя или ""}.
+        "line_sum": сумма добавленной строки, "hours": записанные нормочасы, "norm_price": цена нормочаса,
+        "executor": ФИО исполнителя или ""}.
         Исключение: OneCError (работа уже в ЗН, ЗН не «В работе», отказ 1С при записи/проведении).
         """
         self._ensure()
@@ -732,7 +802,14 @@ class OneC:
                     raise OneCError("ЗН уже не в состоянии «В работе».")
                 vat = doc.Работы.Получить(0).СтавкаНДС if doc.Работы.Количество() else self._default_vat()
                 price = float(norm.Цена)
-                amount = round(hours * price, 2)
+                if amount is not None:
+                    if price <= 0:
+                        raise OneCError("Цена нормочаса в 1С равна нулю, пересчитать сумму в часы нельзя.")
+                    hours = round(amount / price, 3)
+                    if hours <= 0:
+                        raise OneCError("Сумма слишком мала: меньше одной тысячной нормочаса.")
+                else:
+                    amount = round(hours * price, 2)
                 row = doc.Работы.Добавить()
                 row.Работа = work_ref
                 work_uid = str(uuid.uuid4())
@@ -772,7 +849,7 @@ class OneC:
             logger.error("Ошибка добавления работы: %s", e)
             raise OneCError("Ошибка связи с 1С при добавлении работы.")
         return {"created_work": created, "work": self.c.String(work_ref),
-                "total": float(doc.СуммаРаботДокумента), "line_sum": amount,
+                "total": float(doc.СуммаРаботДокумента), "line_sum": amount, "hours": hours, "norm_price": price,
                 "executor": self.default_executor if assign_executor else ""}
 
     def _executor(self, full_name: str):
@@ -857,7 +934,8 @@ class OneC:
 
         Параметры (клиент: одно из двух, машина: одно из двух):
             client_id: идентификатор существующего клиента; либо
-            new_client: {"name": ФИО, "phone": телефон} — клиент будет создан.
+            new_client: {"name": ФИО или наименование организации, "phone": телефон, "legal": True для
+                юридического лица} — клиент будет создан.
             car_id: идентификатор существующего автомобиля клиента; либо
             new_car: {"brand", "model", "gos", "vin", "year"} — машина будет создана и привязана к клиенту.
 
@@ -875,7 +953,8 @@ class OneC:
             self.c.НачатьТранзакцию()
             try:
                 if new_client:
-                    client_id = self.add_client(new_client["name"], new_client.get("phone", ""))["id"]
+                    client_id = self.add_client(new_client["name"], new_client.get("phone", ""),
+                                                legal=new_client.get("legal", False))["id"]
                 client_ref = self._ref("Контрагенты", client_id)
                 if new_car:
                     created = self.add_car(client_id, new_car["brand"], new_car["model"], new_car["gos"],
@@ -934,22 +1013,30 @@ class OneC:
         return {"id": self._ref_id(doc.Ссылка), "number": number,
                 "customer": client_ref.Наименование, "car": car_ref.Наименование}
 
+    USED_NOTE = "запчасть б/у"
+
     def add_customer_part_to_order(self, order_id: str, qty: float, part_id: str = "",
-                                   new_part_name: str = "") -> Dict:
+                                   new_part_name: str = "", new_part_article: str = "",
+                                   used: bool = False) -> Dict:
         """Добавляет запчасть клиента (вкладка «Материалы заказчика») в заказ-наряд «В работе».
 
         Параметры:
             order_id: идентификатор ЗН. qty: количество (> 0).
             part_id: идентификатор существующей номенклатуры (запчасти); либо
             new_part_name: название новой запчасти (создаётся в «Номенклатуре», группа
-                «Запчасти для разнесения», как в add_part).
+                «Запчасти для разнесения», как в add_part) и new_part_article — её артикул (пусто —
+                артикул создаётся автоматически из названия).
+            used: запчасть б/у: в строке в поле «Примечание номенклатура печать» пишется «запчасть б/у».
 
-        Единица измерения и коэффициент берутся из карточки запчасти. Если такая запчасть уже есть в
-        материалах заказчика этого ЗН, количество увеличивается в существующей строке. Проведённый
-        документ перепроводится. Всё выполняется в одной транзакции: при ошибке ничего не остаётся.
+        Единица измерения и коэффициент берутся из карточки запчасти. Если такая запчасть с тем же
+        признаком (новая / б/у) уже есть в материалах заказчика этого ЗН, количество увеличивается в
+        существующей строке. 1С не допускает две строки одной номенклатуры в этой таблице, поэтому если
+        та же номенклатура уже есть с другим признаком (новая вместо б/у или наоборот), бросается OneCError
+        с советом добавить её отдельной позицией. Проведённый документ перепроводится. Всё выполняется
+        в одной транзакции: при ошибке ничего не остаётся.
 
-        Возвращает {"created_part": bool, "part": название, "qty": добавленное количество,
-        "total_qty": количество в строке ЗН после добавления, "unit": единица}.
+        Возвращает {"created_part": bool, "part": название, "article": артикул, "used": bool,
+        "qty": добавленное количество, "total_qty": количество в строке ЗН после добавления, "unit": единица}.
         Исключение: OneCError (ЗН не «В работе», отказ 1С при записи/проведении, нет связи).
         """
         self._ensure()
@@ -963,16 +1050,23 @@ class OneC:
                     guid = self.c.NewObject("УникальныйИдентификатор", part_id)
                     part_ref = self.c.Справочники.Номенклатура.ПолучитьСсылку(guid)
                 else:
-                    part_ref = self._create_part(new_part_name)
+                    part_ref = self._create_part(new_part_name, new_part_article)
                 doc = self._order_ref(order_id).ПолучитьОбъект()
                 if self.c.String(doc.Состояние) != "В работе":
                     raise OneCError("ЗН уже не в состоянии «В работе».")
                 part = part_ref.ПолучитьОбъект()
                 unit = part.ОсновнаяЕдиницаИзмерения
+                note = self.USED_NOTE if used else ""
                 row = None
                 for i in range(doc.МатериалыЗаказчика.Количество()):
                     candidate = doc.МатериалыЗаказчика.Получить(i)
                     if self.c.XMLString(candidate.Номенклатура) == self.c.XMLString(part_ref):
+                        if (candidate.ПримечаниеНоменклатураПечать or "") != note:
+                            was = "б/у" if candidate.ПримечаниеНоменклатураПечать else "новая"
+                            raise OneCError(
+                                f"Эта запчасть уже есть в ЗН как {was}, а 1С не допускает две строки одной "
+                                f"номенклатуры. Добавьте её отдельной позицией («Добавить новую») "
+                                f"или измените количество в существующей строке.")
                         row = candidate
                         break
                 if row is not None:
@@ -983,6 +1077,8 @@ class OneC:
                     row.Количество = qty
                     row.ЕдиницаИзмерения = unit
                     row.Коэффициент = float(unit.Коэффициент) if not unit.Пустая() and float(unit.Коэффициент) else 1
+                    if note:
+                        row.ПримечаниеНоменклатураПечать = note
                 try:
                     if doc.Проведен:
                         doc.Записать(self.c.РежимЗаписиДокумента.Проведение)
@@ -1000,20 +1096,27 @@ class OneC:
             self.c = None
             logger.error("Ошибка добавления запчасти клиента: %s", e)
             raise OneCError("Ошибка связи с 1С при добавлении запчасти клиента.")
-        return {"created_part": created, "part": part.Наименование, "qty": qty,
-                "total_qty": float(row.Количество), "unit": self.c.String(row.ЕдиницаИзмерения)}
+        return {"created_part": created, "part": part.Наименование, "article": part.Артикул or "",
+                "used": used, "qty": qty, "total_qty": float(row.Количество),
+                "unit": self.c.String(row.ЕдиницаИзмерения)}
 
     # ---------- запись ----------
 
-    def add_client(self, full_name: str, phone: str = "") -> Dict:
+    def add_client(self, full_name: str, phone: str = "", legal: bool = False) -> Dict:
         """Создаёт клиента в справочнике «Контрагенты».
 
         Параметры:
-            full_name: ФИО одной строкой («Фамилия Имя Отчество»); разбивается на Фамилию/Имя/Отчество.
-            phone: телефон (в «Основной телефон»), может быть пустым.
+            full_name: для физического лица — ФИО одной строкой («Фамилия Имя Отчество»), разбивается на
+                Фамилию/Имя/Отчество; для юридического — наименование организации целиком.
+            legal: True — юридическое лицо (форма собственности «Юридическое лицо», ФИО и согласие на
+                обработку персональных данных не заполняются, 1С их для юрлица не требует); False —
+                физическое лицо (форма собственности «Частное лицо»).
+            phone: телефон, может быть пустым. Если в нём не меньше 5 цифр, номер сохраняется только цифрами
+                (как это делает 1С) и записывается в «Основной телефон» и в контактную информацию клиента
+                (см. _set_client_phone); иначе в «Основной телефон» кладётся текст как есть.
 
-        Заполняется то, что требует 1С: вид «Покупатель», форма собственности «Частное лицо», согласие
-        на обработку персональных данных «Спрашивать», ФИО. Если клиент с таким именем уже есть
+        Заполняется то, что требует 1С: вид «Покупатель», форма собственности, а для физлица ещё и согласие
+        на обработку персональных данных «Спрашивать» и ФИО. Если клиент с таким именем уже есть
         (без учёта регистра), ничего не создаётся.
 
         Возвращает {"id", "name", "phone", "created": True/False}.
@@ -1021,6 +1124,9 @@ class OneC:
         """
         self._ensure()
         full_name = " ".join(full_name.split())
+        digits = re.sub(r"\D", "", phone)
+        if len(digits) >= 5:
+            phone = digits
         existing = self.find_clients(full_name)
         for client in existing:
             if client["name"].lower() == full_name.lower():
@@ -1033,14 +1139,19 @@ class OneC:
                 obj = self.c.Справочники.Контрагенты.СоздатьЭлемент()
                 obj.Наименование = self._trim("Контрагенты", full_name)
                 obj.НаименованиеПолное = full_name
-                obj.Фамилия = parts[0]
-                obj.Имя = parts[1] if len(parts) > 1 else ""
-                obj.Отчество = parts[2] if len(parts) > 2 else ""
                 obj.ОсновнойТелефон = phone
                 obj.ВидКонтрагента = self.c.Перечисления.ВидыКонтрагентов.Покупатель
-                obj.ФормаСобственности = self.c.Перечисления.ФормыСобственности.ЧастноеЛицо
-                obj.СогласиеНаОбработкуПерсональныхДанных = self.c.Перечисления.ВариантыОтветов.Спрашивать
+                if legal:
+                    obj.ФормаСобственности = self.c.Перечисления.ФормыСобственности.ЮридическоеЛицо
+                else:
+                    obj.Фамилия = parts[0]
+                    obj.Имя = parts[1] if len(parts) > 1 else ""
+                    obj.Отчество = parts[2] if len(parts) > 2 else ""
+                    obj.ФормаСобственности = self.c.Перечисления.ФормыСобственности.ЧастноеЛицо
+                    obj.СогласиеНаОбработкуПерсональныхДанных = self.c.Перечисления.ВариантыОтветов.Спрашивать
                 self._write(obj, "клиент")
+                if len(digits) >= 5:
+                    self._set_client_phone(obj.Ссылка, digits)
                 self.c.ЗафиксироватьТранзакцию()
             except Exception:
                 self.c.ОтменитьТранзакцию()
@@ -1049,8 +1160,32 @@ class OneC:
             self.c = None
             logger.error("Ошибка добавления клиента: %s", e)
             raise OneCError("Ошибка связи с 1С при добавлении клиента.")
-        logger.info("Добавлен клиент: %s", full_name)
+        logger.info("Добавлен клиент (%s): %s", "юр. лицо" if legal else "физ. лицо", full_name)
         return {"id": self._ref_id(obj.Ссылка), "name": obj.Наименование, "phone": phone, "created": True}
+
+    def _set_client_phone(self, client_ref, digits: str):
+        """Записывает телефон клиента в регистр сведений «Контактная информация» так же, как это делает форма 1С.
+
+        Запись: объект — клиент, тип «Телефон», вид «Мобильный телефон», значение по умолчанию = Да,
+        «Поле3» (номер), «Поле5» и «Представление» = цифры номера, «CRM поле хранения номера» = «1» + последние
+        10 цифр. Регистр «Номера телефонов для поиска» 1С заполняет сама при записи.
+        Вызывается внутри транзакции add_client. Исключение: OneCError, если не найден вид «Мобильный телефон».
+        """
+        kind = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 Вид.Ссылка КАК Ссылка ИЗ Справочник.ВидыКонтактнойИнформации КАК Вид "
+            "ГДЕ Вид.Наименование = &Н", {"Н": "Мобильный телефон"})
+        if kind is None:
+            raise OneCError("В 1С не найден вид контактной информации «Мобильный телефон».")
+        rec = self.c.РегистрыСведений.КонтактнаяИнформация.СоздатьМенеджерЗаписи()
+        rec.Объект = client_ref
+        rec.Тип = self.c.Перечисления.ТипыКонтактнойИнформации.Телефон
+        rec.Вид = kind
+        rec.ЗначениеПоУмолчанию = True
+        rec.Поле3 = digits
+        rec.Поле5 = digits
+        rec.Представление = digits
+        rec.CRM_ПолеХраненияНомера = float("1" + digits[-10:])
+        self._write(rec, "телефон клиента")
 
     def add_car(self, client_id: str, brand: str, model: str, gos_number: str,
                 vin: str = "", year: int = 0) -> Dict:
