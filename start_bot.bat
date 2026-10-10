@@ -1,6 +1,18 @@
 @echo off
 cd /d "%~dp0"
 
+echo === Checking that the bot is not running ===
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -like '*run_bot.py*' }) { exit 1 } else { exit 0 }"
+if errorlevel 1 (
+    echo.
+    echo [!] The bot is already running, so it cannot be updated.
+    echo     Close it first ^(close its console window or end the python process in Task Manager^),
+    echo     then run this file again.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo === Updating from GitHub ===
 git pull --ff-only
 if errorlevel 1 echo [!] Update failed. Starting the current version.
