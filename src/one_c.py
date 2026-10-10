@@ -92,7 +92,13 @@ class OneC:
             return True
         except Exception as e:
             self.c = None
-            logger.error("Ошибка подключения к 1С: %s", e)
+            logger.error("Ошибка подключения к 1С: %s: %s", type(e).__name__, e)
+            if isinstance(e, AttributeError) and "Connect" in str(e):
+                logger.error(
+                    "COM-коннектор 1С создан, но метод Connect недоступен. Обычно это битая регистрация "
+                    "comcntr.dll: в терминале ОТ АДМИНИСТРАТОРА выполните regsvr32 \"<каталог 1С>\\bin\\comcntr.dll\" "
+                    "для установленной версии платформы (32-битной) и удалите папку %%TEMP%%\\gen_py. "
+                    "Подробности в README (раздел «Типовые ошибки»).")
             return False
 
     def _ensure(self):
