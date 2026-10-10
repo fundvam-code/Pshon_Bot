@@ -94,7 +94,7 @@ works_log.addHandler(_wh)
  CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_AMOUNT,
  CLIENT_CONFIRM, CAR_CONFIRM, CAT_NAME, CAT_CONFIRM, ZN_PART_NAME, ZN_PART_PICK, ZN_PART_QTY,
  ZN_NEW_CLIENT, ZN_NEW_PICK, ZN_NEW_NAME, ZN_NEW_PHONE, ZN_CAR_PICK, ZN_NEW_CONFIRM,
- ZN_PART_COND, ZN_PART_ARTICLE, ZN_NEW_TYPE) = range(30)
+ ZN_PART_COND, ZN_PART_ARTICLE, ZN_NEW_TYPE, CAT_ARTICLE) = range(31)
 
 VIN_RE = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
 CANCEL = ("✖️ Отмена", "x:cancel")
@@ -106,7 +106,7 @@ FLOW_KEYS = ('client_name', 'phone', 'client', 'candidates', 'brand', 'model', '
              'part_id', 'part_name', 'new_part', 'new_part_candidate', 'part_options',
              'part_used', 'part_article', 'part_name_typed', 'new_part_article',
              'zn_flow', 'zn_query', 'zn_new_client', 'zn_car', 'client_cars', 'new_car',
-             'client_legal', 'zn_legal')
+             'client_legal', 'zn_legal', 'cat_article')
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -386,7 +386,7 @@ class AutoServiceBot:
         if data == "x:skip":
             step = {CLIENT_PHONE: self._client_phone, CAR_VIN: self._car_vin, CAR_YEAR: self._car_year,
                     CAR_BRAND: self._skip_car, ZN_NEW_PHONE: self._zn_new_phone,
-                    ZN_PART_ARTICLE: self._zn_part_article}.get(d.get('state'))
+                    ZN_PART_ARTICLE: self._zn_part_article, CAT_ARTICLE: self._cat_article}.get(d.get('state'))
             if step:
                 return await step(update, context, "")
             return await self.route(update, context, "m:main")
@@ -421,8 +421,12 @@ class AutoServiceBot:
         if data in ("a:addpart", "a:addwork") and self.can_use_refs(uid):
             kind = "part" if data == "a:addpart" else "work"
             d['cat'] = kind
-            what = "запчасти" if kind == "part" else "работы"
-            return await self.ask(update, context, f"Введите название {what}:", kb([CANCEL]), CAT_NAME, "m:refs")
+            if kind == "part":
+                return await self.ask(
+                    update, context,
+                    "Введите артикул запчасти.\nЕсли артикула нет, нажмите «Пропустить»: он будет создан "
+                    "автоматически из названия.", kb([SKIP, CANCEL]), CAT_ARTICLE, "m:refs")
+            return await self.ask(update, context, "Введите название работы:", kb([CANCEL]), CAT_NAME, "m:refs")
 
         if data == "a:newzn" and has(uid, P.VIEW_WORK):
             d['zn_flow'] = True
@@ -1199,13 +1203,38 @@ class AutoServiceBot:
 
     # ---------- справочники: запчасти и названия работ ----------
 
+    async def handle_cat_article(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «артикул» при добавлении запчасти в справочник (текстом): передаёт значение в _cat_article."""
+        return await self._cat_article(update, context, " ".join(update.message.text.split())[:50])
+
+    async def _cat_article(self, update, context, article: str):
+        """Принимает артикул запчасти (пустой — кнопка «Пропустить») и сверяет его со справочником.
+
+        Артикул уже есть — сообщает, что такая запись существует (с её названием), и ничего не создаёт.
+        Иначе спрашивает наименование.
+        """
+        await self.drop_prompt(context)
+        d = context.user_data
+        d['cat_article'] = article
+        if article:
+            try:
+                found = self.one_c.find_parts_by_article(article)
+            except OneCError as e:
+                return await self.done(update, context, f"❌ {e}", 'refs')
+            if found:
+                return await self.done(
+                    update, context,
+                    f"Такая запись уже существует: «{found[0]['name']}» (артикул {found[0]['article']}).", 'refs')
+        return await self.ask(update, context, "Введите наименование запчасти:", kb([CANCEL]), CAT_NAME, "m:refs")
+
     async def handle_cat_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Шаг «название» при добавлении запчасти или названия работы (user_data['cat'] = 'part' | 'work').
 
-        Сверяет с 1С: точное совпадение (без учёта регистра) — сообщает, что запись существует;
-        есть похожие — показывает их списком и кнопки «Добавить» / «Отмена»; ничего похожего нет —
-        добавляет запись сразу. Запчасти попадают в папку «Запчасти для разнесения»,
-        работы — в «Работы для разнесения».
+        Работа: сверяет с 1С по названию: точное совпадение (без учёта регистра) — сообщает, что запись
+        существует; есть похожие — показывает их списком и кнопки «Добавить» / «Отмена»; ничего похожего нет —
+        добавляет запись сразу (папка «Работы для разнесения»).
+        Запчасть: артикул уже введён и проверен (или создаётся из названия — тогда он сверяется со справочником
+        в OneC.add_part), запись добавляется в папку «Запчасти для разнесения».
         """
         await self.drop_prompt(context)
         d = context.user_data
@@ -1215,8 +1244,10 @@ class AutoServiceBot:
         if len(name) < 2 or len(name) > 100:
             return await self.ask(update, context, f"Введите название {what} (от 2 до 100 символов):",
                                   kb([CANCEL]), CAT_NAME, "m:refs")
+        if kind == "part":
+            return await self._cat_add(update, context, name)
         try:
-            found = self.one_c.find_parts(name) if kind == "part" else self.one_c.find_works(name)
+            found = self.one_c.find_works(name)
         except OneCError as e:
             return await self.done(update, context, f"❌ {e}", 'refs')
         if found['exact']:
@@ -1243,18 +1274,23 @@ class AutoServiceBot:
         """
         kind = context.user_data.get('cat', 'part')
         try:
-            res = self.one_c.add_part(name) if kind == "part" else self.one_c.add_work(name)
+            if kind == "part":
+                res = self.one_c.add_part(name, context.user_data.get('cat_article', ''))
+            else:
+                res = self.one_c.add_work(name)
         except OneCError as e:
             return await self.done(update, context, f"❌ {e}", 'refs')
+        article = f" (артикул {res['article']})" if res.get('article') else ""
         if not res['created']:
-            return await self.done(update, context, f"Такая запись уже существует: «{res['name']}».", 'refs')
+            return await self.done(update, context, f"Такая запись уже существует: «{res['name']}»{article}.", 'refs')
         what = "запчасть" if kind == "part" else "работу"
         user = update.effective_user
-        works_log.info("Пользователь %s (%s) добавил %s «%s» в папку «%s»",
-                       self.access.get_user(user.id).get('name', ''), user.id, what, res['name'], res['folder'])
+        works_log.info("Пользователь %s (%s) добавил %s «%s»%s в папку «%s»",
+                       self.access.get_user(user.id).get('name', ''), user.id, what, res['name'], article,
+                       res['folder'])
         label = "Запчасть" if kind == "part" else "Работа"
         return await self.done(update, context,
-                               f"✅ {label} «{res['name']}» добавлена в папку «{res['folder']}».", 'refs')
+                               f"✅ {label} «{res['name']}»{article} добавлена в папку «{res['folder']}».", 'refs')
 
     # ---------- запуск ----------
 
@@ -1314,6 +1350,7 @@ class AutoServiceBot:
                 ZN_PART_NAME: st(self.handle_zn_part_name),
                 ZN_PART_PICK: st(self.pick_by_button),
                 ZN_PART_QTY: st(self.handle_zn_part_qty),
+                CAT_ARTICLE: st(self.handle_cat_article),
                 CAT_NAME: st(self.handle_cat_name),
                 CAT_CONFIRM: st(self.pick_by_button),
             },

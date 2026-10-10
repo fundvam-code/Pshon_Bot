@@ -686,22 +686,28 @@ class OneC:
         self._write(item, "запчасть")
         return item.Ссылка
 
-    def add_part(self, name: str) -> Dict:
+    def add_part(self, name: str, article: str = "") -> Dict:
         """Добавляет запчасть в справочник «Номенклатура» (в группу «Запчасти для разнесения»).
 
-        Если запчасть с таким названием уже есть (без учёта регистра), ничего не создаётся.
-        Возвращает {"created": True/False, "name": название, "folder": группа}.
+        Параметры: name — наименование; article — артикул (пусто — создаётся из названия: название без
+        пробелов, до 25 символов). Запчасть считается существующей, если в справочнике уже есть товар с
+        таким артикулом (1С не допускает одинаковые артикулы); тогда ничего не создаётся.
+        Возвращает {"created": True/False, "name": наименование, "article": артикул, "folder": группа};
+        для уже существующей — её наименование и артикул.
         Исключение: OneCError при отказе 1С или ошибке связи.
         """
         self._ensure()
         name = " ".join(name.split())
-        exact = self.find_parts(name)["exact"]
-        if exact:
-            return {"created": False, "name": exact["name"], "folder": self.PARTS_GROUP}
+        article = " ".join(article.split())
+        final_article = article or "".join(name.split())[:25]
+        found = self.find_parts_by_article(final_article)
+        if found:
+            return {"created": False, "name": found[0]["name"], "article": found[0]["article"],
+                    "folder": self.PARTS_GROUP}
         try:
             self.c.НачатьТранзакцию()
             try:
-                self._create_part(name)
+                self._create_part(name, article)
                 self.c.ЗафиксироватьТранзакцию()
             except Exception:
                 self.c.ОтменитьТранзакцию()
@@ -710,7 +716,7 @@ class OneC:
             self.c = None
             logger.error("Ошибка добавления запчасти: %s", e)
             raise OneCError("Ошибка связи с 1С при добавлении запчасти.")
-        return {"created": True, "name": name, "folder": self.PARTS_GROUP}
+        return {"created": True, "name": name, "article": final_article, "folder": self.PARTS_GROUP}
 
     def _work_in_order(self, order_ref, work_ref) -> bool:
         """Проверяет, есть ли работа уже в табличной части «Работы» заказ-наряда.
