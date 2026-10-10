@@ -21,7 +21,17 @@
     zn:<...>      выбор ЗН по номеру в списке или действие над выбранным ЗН (menu, info, works, add)
     wk:<n|new>    выбор похожей работы из списка или «добавить новую»
     cl:<n>        выбор клиента из нескольких найденных (при добавлении машины)
-    x:cancel / x:skip   «Отмена» (возврат на экран из user_data['back']) и «Пропустить»
+    cc:<n>        «Добавить машину» найденному клиенту (кнопка под результатом поиска)
+    x:cancel / x:skip / x:ok   «Отмена» (возврат на экран из user_data['back']), «Пропустить» /
+                  «Без машины», «Подтвердить» (запись в 1С)
+
+Сценарий «Добавить клиента»: ФИО → телефон → экран с данными клиента → «Подтвердить» (клиент создаётся
+в 1С) → сразу ввод машины (марка, модель, госномер, VIN, год; на первом шаге есть «Без машины») →
+экран «Кому и какая машина» → «Подтвердить» (машина создаётся в 1С). До подтверждений в 1С ничего не пишется.
+То же добавление машины запускается из «Добавить машину» и из результата поиска клиента.
+
+Справочники → «Добавить з/ч» и «Добавить название работы»: название → сверка с 1С → (похожие: список и
+«Добавить»/«Отмена») → запись в папку «Запчасти для разнесения» / «Работы для разнесения».
 
 Данные сценария лежат в context.user_data (client_name, client, brand, model, gos, vin, order, …);
 по завершении сценария они очищаются, выбранный ЗН ('order') сохраняется внутри раздела ЗН.
@@ -66,13 +76,16 @@ _wh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 works_log.addHandler(_wh)
 
 (MENU, SEARCH, CLIENT_NAME, CLIENT_PHONE, CAR_SEARCH, CAR_PICK, CAR_BRAND, CAR_MODEL,
- CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_HOURS) = range(14)
+ CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_HOURS,
+ CLIENT_CONFIRM, CAR_CONFIRM, CAT_NAME, CAT_CONFIRM) = range(18)
 
 VIN_RE = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
 CANCEL = ("✖️ Отмена", "x:cancel")
 SKIP = ("⏭ Пропустить", "x:skip")
-FLOW_KEYS = ('client_name', 'client', 'candidates', 'brand', 'model', 'gos', 'vin',
-             'work_id', 'work_name', 'new_work', 'new_work_candidate', 'work_options')
+SKIP_CAR = ("⏭ Без машины", "x:skip")
+OK = ("✅ Подтвердить", "x:ok")
+FLOW_KEYS = ('client_name', 'phone', 'client', 'candidates', 'brand', 'model', 'gos', 'vin', 'year',
+             'after_client', 'cat', 'cat_name', 'work_id', 'work_name', 'new_work', 'new_work_candidate', 'work_options')
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -110,15 +123,16 @@ class AutoServiceBot:
         """Форматирует число для вывода: разделитель тысяч — пробел, без лишних нулей (1250.5 → «1 250.5», 110.0 → «110»)."""
         return f"{value:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
 
-    async def show(self, update: Update, text: str, markup=None):
+    async def show(self, update: Update, text: str, markup=None, new: bool = False):
         """Показывает экран: правит текущее сообщение при нажатии кнопки, иначе отправляет новое.
 
-        Параметры: update; text — текст; markup — inline-клавиатура или None.
+        Параметры: update; text — текст; markup — inline-клавиатура или None;
+        new — всегда отправлять новое сообщение (чтобы не затирать, например, результат поиска).
         Возвращает объект сообщения (чтобы позже убрать у него кнопки, см. drop_prompt).
         Если Telegram не даёт отредактировать сообщение (например, оно устарело), отправляет новое.
         """
         q = update.callback_query
-        if q:
+        if q and not new:
             try:
                 res = await q.edit_message_text(text, reply_markup=markup)
                 return res if not isinstance(res, bool) else q.message
@@ -137,16 +151,17 @@ class AutoServiceBot:
             await update.effective_message.reply_text(part)
         await self.show(update, chunks[-1], markup)
 
-    async def ask(self, update, context, text, markup, state, back):
+    async def ask(self, update, context, text, markup, state, back, new: bool = False):
         """Задаёт вопрос и переводит диалог в состояние ожидания ответа.
 
         Параметры:
-            text, markup: вопрос и кнопки (обычно «Отмена», иногда «Пропустить»).
+            text, markup: вопрос и кнопки (обычно «Отмена», иногда «Пропустить» или «Подтвердить»).
             state: состояние ConversationHandler, которое нужно вернуть.
             back: callback_data экрана, куда вернёт кнопка «Отмена» (например, "m:clients" или "zn:menu").
+            new: отправить вопрос новым сообщением, а не править текущее.
         Запоминает сообщение-вопрос и состояние в user_data, возвращает state.
         """
-        context.user_data['prompt'] = await self.show(update, text, markup)
+        context.user_data['prompt'] = await self.show(update, text, markup, new=new)
         context.user_data['state'] = state
         context.user_data['back'] = back
         return state
@@ -184,7 +199,11 @@ class AutoServiceBot:
         """
         has = self.access.has_permission
         if name == 'refs':
-            return "📚 Справочники", kb([("👥 Клиенты и машины", "m:clients")], [("⬅️ Назад", "m:main")])
+            return "📚 Справочники", kb(
+                [("👥 Клиенты и машины", "m:clients")],
+                [("🔩 Добавить з/ч", "a:addpart")],
+                [("🛠 Добавить название работы", "a:addwork")],
+                [("⬅️ Назад", "m:main")])
         if name == 'clients':
             rows = []
             if has(uid, P.VIEW_CLIENTS):
@@ -342,10 +361,25 @@ class AutoServiceBot:
             return await self.route(update, context, back)
 
         if data == "x:skip":
-            step = {CLIENT_PHONE: self._client_phone, CAR_VIN: self._car_vin, CAR_YEAR: self._car_year}.get(d.get('state'))
+            step = {CLIENT_PHONE: self._client_phone, CAR_VIN: self._car_vin, CAR_YEAR: self._car_year,
+                    CAR_BRAND: self._skip_car}.get(d.get('state'))
             if step:
                 return await step(update, context, "")
             return await self.route(update, context, "m:main")
+
+        if data == "x:ok":
+            step = {CLIENT_CONFIRM: self._client_commit, CAR_CONFIRM: self._car_commit,
+                    CAT_CONFIRM: self._cat_commit}.get(d.get('state'))
+            if step:
+                return await step(update, context)
+            return await self.route(update, context, "m:main")
+
+        if data.startswith("cc:") and has(uid, P.ADD_CAR):
+            found = d.get('found') or []
+            idx = data[3:]
+            if idx.isdigit() and int(idx) < len(found):
+                return await self.choose_client(update, context, found[int(idx)], new=True)
+            return await self.route(update, context, "m:clients")
 
         if data == "a:find" and has(uid, P.VIEW_CLIENTS):
             return await self.ask(update, context, "Введите ФИО или телефон клиента:", kb([CANCEL]), SEARCH, "m:clients")
@@ -355,6 +389,12 @@ class AutoServiceBot:
         if data == "a:addcar" and has(uid, P.ADD_CAR):
             return await self.ask(update, context, "Введите ФИО или телефон владельца машины:", kb([CANCEL]),
                                   CAR_SEARCH, "m:clients")
+
+        if data in ("a:addpart", "a:addwork") and self.can_use_refs(uid):
+            kind = "part" if data == "a:addpart" else "work"
+            d['cat'] = kind
+            what = "запчасти" if kind == "part" else "работы"
+            return await self.ask(update, context, f"Введите название {what}:", kb([CANCEL]), CAT_NAME, "m:refs")
 
         if data == "a:open":
             return await self.open_orders(update, context)
@@ -552,7 +592,12 @@ class AutoServiceBot:
         return "\n".join(lines)
 
     async def handle_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Шаг «найти клиента»: ищет по ФИО или телефону и выводит клиентов вместе с их машинами."""
+        """Шаг «найти клиента»: ищет по ФИО или телефону и выводит клиентов вместе с их машинами.
+
+        Под результатом, если у пользователя есть право добавлять машины, для каждого найденного клиента
+        есть кнопка «Добавить машину: ФИО» (callback cc:<n>) — она сразу запускает ввод машины для него.
+        Найденные клиенты запоминаются в user_data['found'].
+        """
         await self.drop_prompt(context)
         query = update.message.text.strip()
         try:
@@ -562,7 +607,15 @@ class AutoServiceBot:
             blocks = [self.format_client(c, self.one_c.get_client_cars(c['id'])) for c in clients]
         except OneCError as e:
             return await self.done(update, context, f"❌ {e}")
-        return await self.done(update, context, "\n\n".join(blocks))
+        self.clear_flow(context)
+        context.user_data['found'] = clients
+        title, menu = self.menu_view(update.effective_user.id, 'clients')
+        rows = []
+        if self.access.has_permission(update.effective_user.id, P.ADD_CAR):
+            rows = kb(*[[(f"🚗 Добавить машину: {c['name']}"[:60], f"cc:{i}")] for i, c in enumerate(clients)]).inline_keyboard
+        markup = InlineKeyboardMarkup(list(rows) + list(menu.inline_keyboard))
+        await update.effective_message.reply_text("\n\n".join(blocks) + f"\n\n{title}", reply_markup=markup)
+        return MENU
 
     # ---------- добавление клиента ----------
 
@@ -581,20 +634,39 @@ class AutoServiceBot:
         return await self._client_phone(update, context, update.message.text.strip())
 
     async def _client_phone(self, update, context, phone: str):
-        """Завершает добавление клиента: создаёт его в 1С (OneC.add_client).
+        """Принимает телефон и показывает данные клиента на подтверждение (в 1С пока ничего не пишется).
 
         Параметры: phone — телефон или пустая строка (кнопка «Пропустить»).
-        Если клиент с таким ФИО уже есть, сообщает об этом и ничего не создаёт.
+        Следующий шаг — кнопка «Подтвердить» (_client_commit) или «Отмена».
         """
         await self.drop_prompt(context)
+        d = context.user_data
+        d['phone'] = phone[:50]
+        text = (f"Проверьте данные нового клиента:\n\n👤 {d['client_name']}\n"
+                f"☎️ {d['phone'] or 'телефон не указан'}\n\nСоздать клиента в 1С?")
+        return await self.ask(update, context, text, kb([OK, CANCEL]), CLIENT_CONFIRM, "m:clients")
+
+    async def _client_commit(self, update, context):
+        """Подтверждение клиента: создаёт его в 1С (OneC.add_client) и сразу переходит к вводу машины.
+
+        Если клиент с таким ФИО уже есть, ничего не создаётся: пользователю сообщается об этом и машина
+        добавляется существующему клиенту. На первом вопросе о машине есть кнопка «Без машины».
+        """
+        d = context.user_data
         try:
-            res = self.one_c.add_client(context.user_data['client_name'], phone[:50])
+            res = self.one_c.add_client(d['client_name'], d['phone'])
         except OneCError as e:
+            await self.drop_prompt(context)
             return await self.done(update, context, f"❌ {e}")
-        if not res['created']:
-            return await self.done(update, context, f"Клиент «{res['name']}» уже есть в 1С.")
-        logger.info("%s добавил клиента %s", update.effective_user.id, res['name'])
-        return await self.done(update, context, f"✅ Клиент «{res['name']}» добавлен в 1С.")
+        if res['created']:
+            logger.info("%s добавил клиента %s", update.effective_user.id, res['name'])
+            head = f"✅ Клиент «{res['name']}» создан в 1С."
+        else:
+            head = f"Клиент «{res['name']}» уже есть в 1С."
+        client = {"id": res["id"], "name": res["name"], "phone": res["phone"]}
+        for key in ('client_name', 'phone'):
+            d.pop(key, None)
+        return await self.choose_client(update, context, client, head=head, optional=True)
 
     # ---------- добавление машины ----------
 
@@ -619,12 +691,28 @@ class AutoServiceBot:
         rows.append([CANCEL])
         return await self.ask(update, context, "Найдено несколько клиентов, выберите:", kb(*rows), CAR_PICK, "m:clients")
 
-    async def choose_client(self, update, context, client):
-        """Запоминает выбранного владельца и спрашивает марку автомобиля."""
-        context.user_data['client'] = client
-        return await self.ask(update, context,
-                              f"Клиент: {client['name']}\nВведите марку автомобиля (например, Toyota):",
-                              kb([CANCEL]), CAR_BRAND, "m:clients")
+    async def choose_client(self, update, context, client, head: str = "", optional: bool = False,
+                            new: bool = False):
+        """Запоминает владельца машины и спрашивает марку автомобиля.
+
+        Параметры: client — {"id", "name", "phone"}; head — строка сверху (например, «Клиент создан»);
+        optional — машина необязательна (сразу после создания клиента): добавляется кнопка «Без машины»;
+        new — задать вопрос новым сообщением (из результата поиска, чтобы не затирать его).
+        """
+        d = context.user_data
+        d['client'] = client
+        d['after_client'] = optional
+        text = (f"{head}\n\n" if head else "") + f"Клиент: {client['name']}\nВведите марку автомобиля (например, Toyota):"
+        markup = kb([SKIP_CAR, CANCEL]) if optional else kb([CANCEL])
+        return await self.ask(update, context, text, markup, CAR_BRAND, "m:clients", new=new)
+
+    async def _skip_car(self, update, context, _value=""):
+        """Кнопка «Без машины» после создания клиента: завершает сценарий, клиент остаётся без машины."""
+        await self.drop_prompt(context)
+        d = context.user_data
+        if not d.get('after_client') or not d.get('client'):
+            return await self.route(update, context, "m:clients")
+        return await self.done(update, context, f"Клиент «{d['client']['name']}» оставлен без машины.")
 
     async def handle_car_brand(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Шаг «марка автомобиля» (например, Toyota)."""
@@ -669,9 +757,10 @@ class AutoServiceBot:
         return await self._car_year(update, context, update.message.text.strip())
 
     async def _car_year(self, update, context, text: str):
-        """Проверяет год (1950 … следующий год) или принимает пустой и создаёт машину в 1С (OneC.add_car).
+        """Проверяет год (1950 … следующий год) или принимает пустой и показывает итог на подтверждение.
 
-        Если машина с таким госномером уже есть, сообщает название и владельца и ничего не создаёт.
+        В итоге перечислено всё: кому (клиент и телефон) и какая машина (марка, модель, госномер, VIN, год).
+        В 1С ничего не пишется до нажатия «Подтвердить» (_car_commit).
         """
         await self.drop_prompt(context)
         year = 0
@@ -682,6 +771,27 @@ class AutoServiceBot:
                                       kb([SKIP, CANCEL]), CAR_YEAR, "m:clients")
             year = int(text)
         d = context.user_data
+        d['year'] = year
+        client = d['client']
+        owner = client['name'] + (f" ({client['phone']})" if client.get('phone') else "")
+        text = "\n".join([
+            "Проверьте данные перед отправкой в 1С:", "",
+            f"👤 Кому: {owner}",
+            f"🚗 Машина: {d['brand']} {d['model']}",
+            f"🔢 Госномер: {d['gos']}",
+            f"VIN: {d['vin'] or 'не указан'}",
+            f"Год выпуска: {year or 'не указан'}", "",
+            "Добавить машину этому клиенту в 1С?"])
+        return await self.ask(update, context, text, kb([OK, CANCEL]), CAR_CONFIRM, "m:clients")
+
+    async def _car_commit(self, update, context):
+        """Подтверждение машины: создаёт её в 1С (OneC.add_car) и привязывает к клиенту.
+
+        Если машина с таким госномером уже есть, сообщает название и владельца и ничего не создаёт.
+        """
+        await self.drop_prompt(context)
+        d = context.user_data
+        year = d.get('year', 0)
         try:
             res = self.one_c.add_car(d['client']['id'], d['brand'], d['model'], d['gos'], d['vin'], year)
         except OneCError as e:
@@ -691,6 +801,65 @@ class AutoServiceBot:
             return await self.done(update, context, f"Машина с номером {d['gos']} уже есть в 1С ({res['name']}{owner}).")
         logger.info("%s добавил авто %s клиенту %s", update.effective_user.id, d['gos'], d['client']['name'])
         return await self.done(update, context, f"✅ Машина «{res['name']}» добавлена клиенту {d['client']['name']}.")
+
+    # ---------- справочники: запчасти и названия работ ----------
+
+    async def handle_cat_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «название» при добавлении запчасти или названия работы (user_data['cat'] = 'part' | 'work').
+
+        Сверяет с 1С: точное совпадение (без учёта регистра) — сообщает, что запись существует;
+        есть похожие — показывает их списком и кнопки «Добавить» / «Отмена»; ничего похожего нет —
+        добавляет запись сразу. Запчасти попадают в папку «Запчасти для разнесения»,
+        работы — в «Работы для разнесения».
+        """
+        await self.drop_prompt(context)
+        d = context.user_data
+        kind = d.get('cat', 'part')
+        what = "запчасти" if kind == "part" else "работы"
+        name = " ".join(update.message.text.split())
+        if len(name) < 2 or len(name) > 100:
+            return await self.ask(update, context, f"Введите название {what} (от 2 до 100 символов):",
+                                  kb([CANCEL]), CAT_NAME, "m:refs")
+        try:
+            found = self.one_c.find_parts(name) if kind == "part" else self.one_c.find_works(name)
+        except OneCError as e:
+            return await self.done(update, context, f"❌ {e}", 'refs')
+        if found['exact']:
+            return await self.done(update, context, f"Такая запись уже существует: «{found['exact']['name']}».", 'refs')
+        if not found['similar']:
+            return await self._cat_add(update, context, name)
+        d['cat_name'] = name
+        folder = OneC.PARTS_GROUP if kind == "part" else OneC.WORK_GROUP
+        listing = "\n".join(f"• {w['name']}" for w in found['similar'])
+        text = (f"Точной записи нет, но есть похожие:\n{listing}\n\n"
+                f"Добавить «{name}» как новую в папку «{folder}»?")
+        return await self.ask(update, context, text, kb([("➕ Добавить", "x:ok"), CANCEL]), CAT_CONFIRM, "m:refs")
+
+    async def _cat_commit(self, update, context):
+        """Кнопка «Добавить» под списком похожих записей: добавляет введённое название."""
+        await self.drop_prompt(context)
+        return await self._cat_add(update, context, context.user_data.get('cat_name', ''))
+
+    async def _cat_add(self, update, context, name: str):
+        """Создаёт запчасть (OneC.add_part) или работу (OneC.add_work) и сообщает результат.
+
+        Создание пишется в logs/added_works.log (кто, что и в какую папку добавил). Если запись за это
+        время появилась в 1С, сообщает, что такая запись существует.
+        """
+        kind = context.user_data.get('cat', 'part')
+        try:
+            res = self.one_c.add_part(name) if kind == "part" else self.one_c.add_work(name)
+        except OneCError as e:
+            return await self.done(update, context, f"❌ {e}", 'refs')
+        if not res['created']:
+            return await self.done(update, context, f"Такая запись уже существует: «{res['name']}».", 'refs')
+        what = "запчасть" if kind == "part" else "работу"
+        user = update.effective_user
+        works_log.info("Пользователь %s (%s) добавил %s «%s» в папку «%s»",
+                       self.access.get_user(user.id).get('name', ''), user.id, what, res['name'], res['folder'])
+        label = "Запчасть" if kind == "part" else "Работа"
+        return await self.done(update, context,
+                               f"✅ {label} «{res['name']}» добавлена в папку «{res['folder']}».", 'refs')
 
     # ---------- запуск ----------
 
@@ -736,6 +905,10 @@ class AutoServiceBot:
                 ZN_WORK_NAME: st(self.handle_zn_work_name),
                 ZN_WORK_PICK: st(self.pick_by_button),
                 ZN_WORK_HOURS: st(self.handle_zn_work_hours),
+                CLIENT_CONFIRM: st(self.pick_by_button),
+                CAR_CONFIRM: st(self.pick_by_button),
+                CAT_NAME: st(self.handle_cat_name),
+                CAT_CONFIRM: st(self.pick_by_button),
             },
             fallbacks=[CommandHandler('start', self.start), CommandHandler('cancel', self.cmd_cancel)],
         )

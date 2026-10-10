@@ -433,6 +433,24 @@ class OneC:
         Возвращает {"exact": {"id","name"} или None, "similar": [остальные найденные]}.
         Исключение: OneCError при ошибке поиска.
         """
+        return self._search_catalog("Автоработы", name)
+
+    def find_parts(self, name: str) -> Dict:
+        """Ищет запчасть в справочнике «Номенклатура» (только товары, без услуг и работ) по названию.
+
+        Алгоритм и результат такие же, как у find_works: {"exact": {...} или None, "similar": [...]}.
+        Исключение: OneCError при ошибке поиска.
+        """
+        return self._search_catalog(
+            "Номенклатура", name,
+            extra="И А.ВидНоменклатуры = ЗНАЧЕНИЕ(Перечисление.ВидыНоменклатуры.Товар) ")
+
+    def _search_catalog(self, catalog: str, name: str, extra: str = "") -> Dict:
+        """Общий поиск по наименованию в справочнике: точное совпадение и похожие записи.
+
+        Параметры: catalog — имя справочника; name — искомое название; extra — дополнительное условие
+        запроса (начинается с «И», псевдоним справочника — А). Группы и помеченные на удаление не берутся.
+        """
         self._ensure()
         name = " ".join(name.split())
         words = [w for w in name.split() if len(w) >= 3][:3] or [name]
@@ -441,8 +459,8 @@ class OneC:
                 params = {f"W{i}": self._like(w) for i, w in enumerate(words)}
                 conds = [f'А.Наименование ПОДОБНО &W{i} СПЕЦСИМВОЛ "\\"' for i in range(len(words))]
                 sel = self._query(
-                    "ВЫБРАТЬ ПЕРВЫЕ 8 А.Ссылка КАК Ссылка, А.Наименование КАК Имя ИЗ Справочник.Автоработы КАК А "
-                    "ГДЕ НЕ А.ЭтоГруппа И НЕ А.ПометкаУдаления И (" + join.join(conds) + ") "
+                    f"ВЫБРАТЬ ПЕРВЫЕ 8 А.Ссылка КАК Ссылка, А.Наименование КАК Имя ИЗ Справочник.{catalog} КАК А "
+                    "ГДЕ НЕ А.ЭтоГруппа И НЕ А.ПометкаУдаления " + extra + "И (" + join.join(conds) + ") "
                     "УПОРЯДОЧИТЬ ПО А.Наименование", params)
                 out = []
                 while sel.Следующий():
@@ -455,8 +473,8 @@ class OneC:
             return {"exact": exact, "similar": similar}
         except pywintypes.com_error as e:
             self.c = None
-            logger.error("Ошибка поиска работ: %s", e)
-            raise OneCError("Ошибка поиска в справочнике авторабот.")
+            logger.error("Ошибка поиска в справочнике %s: %s", catalog, e)
+            raise OneCError("Ошибка поиска в справочнике 1С.")
 
     def _work_group(self):
         """Находит группу «Работы для разнесения» справочника «Автоработы» или создаёт её.
@@ -507,6 +525,116 @@ class OneC:
         work.Номенклатура = self._work_nomenclature()
         self._write(work, "авторабота")
         return work.Ссылка
+
+    def add_work(self, name: str) -> Dict:
+        """Добавляет в справочник «Автоработы» новую работу (в группу «Работы для разнесения»).
+
+        Если работа с таким названием уже есть (без учёта регистра), ничего не создаётся.
+        Возвращает {"created": True/False, "name": название, "folder": группа}.
+        Исключение: OneCError при отказе 1С или ошибке связи.
+        """
+        self._ensure()
+        name = " ".join(name.split())
+        exact = self.find_works(name)["exact"]
+        if exact:
+            return {"created": False, "name": exact["name"], "folder": self.WORK_GROUP}
+        try:
+            self.c.НачатьТранзакцию()
+            try:
+                self._create_work(name)
+                self.c.ЗафиксироватьТранзакцию()
+            except Exception:
+                self.c.ОтменитьТранзакцию()
+                raise
+        except pywintypes.com_error as e:
+            self.c = None
+            logger.error("Ошибка добавления работы: %s", e)
+            raise OneCError("Ошибка связи с 1С при добавлении работы.")
+        return {"created": True, "name": name, "folder": self.WORK_GROUP}
+
+    # ---------- запчасти ----------
+
+    PARTS_GROUP = "Запчасти для разнесения"
+
+    def _first(self, text: str, params: Optional[Dict] = None):
+        """Ссылка из первой строки запроса (колонка «Ссылка») или None, если запрос пуст."""
+        sel = self._query(text, params)
+        return sel.Ссылка if sel.Следующий() else None
+
+    def _parts_group(self):
+        """Находит группу «Запчасти для разнесения» в справочнике «Номенклатура» или создаёт её."""
+        ref = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 Н.Ссылка КАК Ссылка ИЗ Справочник.Номенклатура КАК Н "
+            "ГДЕ Н.ЭтоГруппа И Н.Наименование = &Н И НЕ Н.ПометкаУдаления", {"Н": self.PARTS_GROUP})
+        if ref:
+            return ref
+        group = self.c.Справочники.Номенклатура.СоздатьГруппу()
+        group.Наименование = self.PARTS_GROUP
+        self._write(group, "группа запчастей")
+        logger.info("Создана группа номенклатуры «%s»", self.PARTS_GROUP)
+        return group.Ссылка
+
+    def _create_part(self, name: str):
+        """Создаёт запчасть в справочнике «Номенклатура» в группе «Запчасти для разнесения».
+
+        Заполняется то, что требует 1С: тип «Штучный», вид «Товар», единица «шт», ставка НДС «Без НДС»,
+        валюта учёта, артикул (как у существующих позиций — название без пробелов) и артикул для поиска.
+        Вызывается внутри транзакции add_part.
+        """
+        item = self.c.Справочники.Номенклатура.СоздатьЭлемент()
+        item.Родитель = self._parts_group()
+        item.Наименование = self._trim("Номенклатура", name)
+        item.НаименованиеПолное = name
+        part_type = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 Т.Ссылка КАК Ссылка ИЗ Справочник.ТипыНоменклатуры КАК Т ГДЕ Т.Наименование = &Н",
+            {"Н": "Штучный"})
+        if part_type is None:
+            raise OneCError("В 1С не найден тип номенклатуры «Штучный».")
+        item.ТипНоменклатуры = part_type
+        item.ВидНоменклатуры = self.c.Перечисления.ВидыНоменклатуры.Товар
+        base_unit = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 Е.Ссылка КАК Ссылка ИЗ Справочник.КлассификаторЕдиницИзмерения КАК Е "
+            "ГДЕ Е.Наименование = &Н", {"Н": "шт"})
+        if base_unit is not None:
+            item.БазоваяЕдиницаИзмерения = base_unit
+        main_unit = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 Е.Ссылка КАК Ссылка ИЗ Справочник.ЕдиницыИзмерения КАК Е "
+            "ГДЕ Е.Наименование = &Н И Е.Владелец = &Т", {"Н": "шт", "Т": part_type})
+        if main_unit is not None:
+            item.ОсновнаяЕдиницаИзмерения = main_unit
+        item.СтавкаНДС = self._default_vat()
+        item.ВалютаУчета = self._accounting_currency()
+        article = "".join(name.split())[:25]
+        item.Артикул = article
+        item.АртикулДляПоиска = article.upper()
+        self._write(item, "запчасть")
+        return item.Ссылка
+
+    def add_part(self, name: str) -> Dict:
+        """Добавляет запчасть в справочник «Номенклатура» (в группу «Запчасти для разнесения»).
+
+        Если запчасть с таким названием уже есть (без учёта регистра), ничего не создаётся.
+        Возвращает {"created": True/False, "name": название, "folder": группа}.
+        Исключение: OneCError при отказе 1С или ошибке связи.
+        """
+        self._ensure()
+        name = " ".join(name.split())
+        exact = self.find_parts(name)["exact"]
+        if exact:
+            return {"created": False, "name": exact["name"], "folder": self.PARTS_GROUP}
+        try:
+            self.c.НачатьТранзакцию()
+            try:
+                self._create_part(name)
+                self.c.ЗафиксироватьТранзакцию()
+            except Exception:
+                self.c.ОтменитьТранзакцию()
+                raise
+        except pywintypes.com_error as e:
+            self.c = None
+            logger.error("Ошибка добавления запчасти: %s", e)
+            raise OneCError("Ошибка связи с 1С при добавлении запчасти.")
+        return {"created": True, "name": name, "folder": self.PARTS_GROUP}
 
     def _work_in_order(self, order_ref, work_ref) -> bool:
         """Проверяет, есть ли работа уже в табличной части «Работы» заказ-наряда.
