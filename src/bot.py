@@ -443,8 +443,9 @@ class AutoServiceBot:
             if kind == "part":
                 return await self.ask(
                     update, context,
-                    "Введите артикул запчасти.\nЕсли артикула нет, нажмите «Пропустить»: он будет создан "
-                    "автоматически из названия.", kb([SKIP, CANCEL]), CAT_ARTICLE, "m:refs")
+                    "Введите артикул запчасти.\nЕсли артикула нет, нажмите «Пропустить»: бот присвоит "
+                    "служебный артикул «БН» с номером (например, БН1).",
+                    kb([SKIP, CANCEL]), CAT_ARTICLE, "m:refs")
             return await self.ask(update, context, "Введите название работы:", kb([CANCEL]), CAT_NAME, "m:refs")
 
         if data == "a:newzn" and has(uid, P.VIEW_WORK):
@@ -681,12 +682,13 @@ class AutoServiceBot:
     async def ask_part_article(self, update, context, head: str = ""):
         """Спрашивает артикул запчасти клиента (шаг после выбора «новая / б/у»).
 
-        Кнопка «Пропустить»: артикул будет создан автоматически из названия. Вызывается и повторно, когда
-        пользователь нажал «Добавить новую» при уже существующем артикуле: нужен другой, уникальный артикул.
+        Кнопка «Пропустить»: бот присвоит служебный артикул «БН» с номером (см. OneC._next_blank_article).
+        Вызывается и повторно, когда пользователь нажал «Добавить новую» при уже существующем артикуле:
+        нужен другой, уникальный артикул.
         """
         context.user_data.pop('part_article', None)
         text = (f"{head}Введите артикул запчасти.\n"
-                f"Если артикула нет, нажмите «Пропустить»: он будет создан автоматически из названия.")
+                f"Если артикула нет, нажмите «Пропустить»: бот присвоит служебный артикул «БН» с номером.")
         return await self.ask(update, context, text, kb([SKIP, CANCEL]), ZN_PART_ARTICLE, "zn:menu")
 
     async def handle_zn_part_article(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -694,7 +696,8 @@ class AutoServiceBot:
         return await self._zn_part_article(update, context, " ".join(update.message.text.split())[:50])
 
     async def _zn_part_article(self, update, context, article: str):
-        """Принимает артикул (пустой — кнопка «Пропустить») и сверяет запчасть по артикулу, а не по названию.
+        """Принимает артикул (пустой — кнопка «Пропустить»: бот присвоит служебный «БН<номер>») и сверяет
+        запчасть по артикулу, а не по названию.
 
         Артикул уже есть в справочнике — показывает найденные запчасти (с названием) кнопками и «Добавить новую».
         Артикула нет — спрашивает наименование (если оно уже известно, сразу переходит к количеству).
@@ -736,9 +739,8 @@ class AutoServiceBot:
     async def _zn_part_name(self, update, context, name: str):
         """Принимает наименование новой запчасти.
 
-        Артикул был введён (и проверен как уникальный) — запчасть будет создана с ним. Артикула нет — он
-        формируется из названия (без пробелов, до 25 символов) и тоже сверяется со справочником: если такой
-        артикул уже есть, показываются найденные запчасти. Дальше — количество.
+        Артикул введён — запчасть создаётся с ним; артикул пропущен — 1С получит служебный «БН<номер>»
+        (см. OneC.add_part / _next_blank_article). Дальше спрашивается количество.
         """
         d = context.user_data
         if len(name) < 2:
@@ -746,23 +748,13 @@ class AutoServiceBot:
                                   kb([CANCEL]), ZN_PART_NAME, "zn:menu")
         d['part_name_typed'] = name
         article = d.get('part_article', '')
+        d['new_part'], d['new_part_article'] = name, article
         if article:
-            d['new_part'], d['new_part_article'] = name, article
-            return await self.ask_qty(
-                update, context, f"Запчасть «{name}» (артикул {article}) будет добавлена в «Запчасти для разнесения».")
-        generated = "".join(name.split())[:25]
-        try:
-            found = self.one_c.find_parts_by_article(generated)
-        except OneCError as e:
-            return await self.done_zn(update, context, f"❌ {e}")
-        if found:
-            return await self.zn_part_options(
-                update, context, found, f"Артикул создаётся из названия («{generated}»), такой уже есть в справочнике.")
-        d['new_part'], d['new_part_article'] = name, ""
-        return await self.ask_qty(
-            update, context,
-            f"Запчасть «{name}» (артикул будет создан автоматически: {generated}) "
-            f"будет добавлена в «Запчасти для разнесения».")
+            head = f"Запчасть «{name}» (артикул {article}) будет добавлена в «Запчасти для разнесения»."
+        else:
+            head = (f"Запчасть «{name}» (без артикула — будет присвоен служебный «БН» с номером) "
+                    f"будет добавлена в «Запчасти для разнесения».")
+        return await self.ask_qty(update, context, head)
 
     async def handle_zn_part_qty(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Шаг «количество»: проверяет число (больше 0, не более 9999; допускается запятая) и добавляет
@@ -1342,7 +1334,8 @@ class AutoServiceBot:
         return await self._cat_article(update, context, " ".join(update.message.text.split())[:50])
 
     async def _cat_article(self, update, context, article: str):
-        """Принимает артикул запчасти (пустой — кнопка «Пропустить») и сверяет его со справочником.
+        """Принимает артикул запчасти (пустой — кнопка «Пропустить»: бот присвоит «БН<номер>») и сверяет его
+        со справочником.
 
         Артикул уже есть — сообщает, что такая запись существует (с её названием), и ничего не создаёт.
         Иначе спрашивает наименование.
@@ -1367,8 +1360,8 @@ class AutoServiceBot:
         Работа: сверяет с 1С по названию: точное совпадение (без учёта регистра) — сообщает, что запись
         существует; есть похожие — показывает их списком и кнопки «Добавить» / «Отмена»; ничего похожего нет —
         добавляет запись сразу (папка «Работы для разнесения»).
-        Запчасть: артикул уже введён и проверен (или создаётся из названия — тогда он сверяется со справочником
-        в OneC.add_part), запись добавляется в папку «Запчасти для разнесения».
+        Запчасть: артикул введён и проверен (или пуст — тогда будет присвоен «БН<номер>»), запись
+        добавляется в папку «Запчасти для разнесения».
         """
         await self.drop_prompt(context)
         d = context.user_data
