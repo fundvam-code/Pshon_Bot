@@ -9,6 +9,10 @@
             → Заказ-наряды → (Сколько в работе ЗН / Редактирование ЗН → ЗН → Инфа / Список работ /
               Добавить работу)
 
+Под полем ввода — постоянная кнопка «🏠 Главное меню» (нижняя reply-клавиатура, см. main_keyboard):
+из любого шага сценария возвращает в главное меню. Нажатие приходит обычным текстом, поэтому
+handle_menu_button подключён ко всем состояниям и перехватывает его раньше шагов ввода данных.
+
 Состояния диалога (ConversationHandler) — это только шаги, где бот ждёт ТЕКСТ или выбор из списка:
     MENU (навигация), SEARCH, CLIENT_NAME, CLIENT_PHONE, CLIENT_ADDRESS, CLIENT_POSTAL, CAR_SEARCH,
     CAR_PICK, CAR_BRAND, CAR_MODEL, CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK,
@@ -64,7 +68,7 @@ import os
 import re
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler,
@@ -103,6 +107,7 @@ works_log.addHandler(_wh)
  ZN_NEW_ADDRESS, ZN_NEW_POSTAL_ASK, ZN_NEW_POSTAL) = range(37)
 
 VIN_RE = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
+MENU_BUTTON = "🏠 Главное меню"
 CANCEL = ("✖️ Отмена", "x:cancel")
 SKIP = ("⏭ Пропустить", "x:skip")
 SKIP_CAR = ("⏭ Без машины", "x:skip")
@@ -320,26 +325,44 @@ class AutoServiceBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start: приветствие и главное меню.
 
-        Сбрасывает незавершённые сценарии и убирает у пользователя старую «нижнюю» клавиатуру
-        (от прежней версии бота) — для этого отправляет и сразу удаляет служебное сообщение.
+        Показывает постоянную нижнюю клавиатуру с кнопкой «Главное меню» (см. main_keyboard) и inline-главное
+        меню отдельным сообщением (у одного сообщения не может быть сразу и reply-, и inline-клавиатуры).
         """
         if not await self._registered(update):
             return ConversationHandler.END
         u = update.effective_user
         context.user_data.clear()
-        old = await update.message.reply_text("⌨️", reply_markup=ReplyKeyboardRemove())
-        try:
-            await old.delete()
-        except Exception:
-            pass
         name = self.access.get_user(u.id).get('name', u.first_name)
         logger.info("Старт: %s (%s)", name, u.id)
+        await update.message.reply_text(f"Здравствуйте, {name}!", reply_markup=self.main_keyboard())
         title, markup = self.menu_view(u.id, 'main')
-        await update.message.reply_text(f"Здравствуйте, {name}!\n{title}", reply_markup=markup)
+        await update.message.reply_text(title, reply_markup=markup)
         return MENU
 
     async def idle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Любой текст вне сценария (и команда /cancel): показывает главное меню."""
+        if not await self._registered(update):
+            return ConversationHandler.END
+        context.user_data.clear()
+        title, markup = self.menu_view(update.effective_user.id, 'main')
+        await update.message.reply_text(title, reply_markup=markup)
+        return MENU
+
+    @staticmethod
+    def main_keyboard() -> ReplyKeyboardMarkup:
+        """Постоянная нижняя клавиатура с кнопкой «Главное меню» (всегда видна над полем ввода).
+
+        Кнопка отправляет текст MENU_BUTTON, который перехватывает handle_menu_button в любом состоянии.
+        `resize_keyboard` делает клавиатуру компактной, `is_persistent` не даёт Telegram свернуть её в иконку.
+        """
+        return ReplyKeyboardMarkup([[MENU_BUTTON]], resize_keyboard=True, is_persistent=True)
+
+    async def handle_menu_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Нажатие нижней кнопки «Главное меню»: сбрасывает текущий сценарий и возвращает в главное меню.
+
+        Обработчик подключён ко всем состояниям диалога (см. run), поэтому нажатие кнопки на шаге ввода
+        (ФИО, телефон, VIN и т. п.) не попадает в данные сценария.
+        """
         if not await self._registered(update):
             return ConversationHandler.END
         context.user_data.clear()
@@ -1441,13 +1464,18 @@ class AutoServiceBot:
             logger.warning("1С недоступна при старте, подключение будет повторяться при запросах")
 
         text = filters.TEXT & ~filters.COMMAND
+        menu_filter = filters.Text([MENU_BUTTON])
         cb = CallbackQueryHandler(self.on_callback)
 
         def st(handler):
-            return [cb, MessageHandler(text, handler)]
+            return [cb,
+                    MessageHandler(menu_filter, self.handle_menu_button),
+                    MessageHandler(text, handler)]
 
         conv = ConversationHandler(
-            entry_points=[CommandHandler('start', self.start), cb, MessageHandler(text, self.idle_text)],
+            entry_points=[CommandHandler('start', self.start),
+                          MessageHandler(menu_filter, self.handle_menu_button),
+                          cb, MessageHandler(text, self.idle_text)],
             states={
                 MENU: st(self.idle_text),
                 SEARCH: st(self.handle_search),
