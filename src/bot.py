@@ -10,8 +10,9 @@
               Добавить работу)
 
 Состояния диалога (ConversationHandler) — это только шаги, где бот ждёт ТЕКСТ или выбор из списка:
-    MENU (навигация), SEARCH, CLIENT_NAME, CLIENT_PHONE, CAR_SEARCH, CAR_PICK, CAR_BRAND, CAR_MODEL,
-    CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_AMOUNT.
+    MENU (навигация), SEARCH, CLIENT_NAME, CLIENT_PHONE, CLIENT_ADDRESS, CLIENT_POSTAL, CAR_SEARCH,
+    CAR_PICK, CAR_BRAND, CAR_MODEL, CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK,
+    ZN_WORK_AMOUNT, ZN_NEW_ADDRESS, ZN_NEW_POSTAL.
 Кнопки обрабатываются в любом состоянии (on_callback → route), поэтому «Отмена» и переход в другое
 меню работают всегда.
 
@@ -26,11 +27,12 @@
                   (порядок: новая/б/у → артикул → сверка по артикулу → наименование → количество)
     zc:<n|new>    при создании ЗН: выбор найденного клиента или «создать нового»
     zk:<n|new>    при создании ЗН: выбор машины клиента или «новая машина»
+    pa:yes|no     «почтовый адрес совпадает с юридическим?»: да (скопировать) / нет (ввести отдельно)
 
 Сценарий «Создать заказ-наряд»: клиент (поиск; нет — создаётся новый) → машина (машины клиента кнопками или
 новая: марка, модель, госномер, VIN, год) → итог → «Подтвердить»: в одной транзакции создаются новые клиент и
 машина и сам ЗН в состоянии «В работе» → «Добавить работы?»; работы в таком ЗН получают исполнителя по
-умолчанию (ONE_C_DEFAULT_EXECUTOR).
+умолчанию (ONE_C_DEFAULT_EXECUTOR). Новый клиент, как и в справочнике, заводится с телефоном и адресом.
     cc:<n>        «Добавить машину» найденному клиенту (кнопка под результатом поиска)
     x:cancel / x:skip / x:ok   «Отмена» (возврат на экран из user_data['back']), «Пропустить» /
                   «Без машины», «Подтвердить» (запись в 1С)
@@ -39,9 +41,11 @@
 a:addclient:fl / a:addclient:ul) и в сценарии создания ЗН (zt:fl / zt:ul). Физлицо создаётся с формой
 собственности «Частное лицо», юрлицо — «Юридическое лицо».
 
-Сценарий «Добавить клиента»: ФИО (для юрлица — наименование организации) → телефон → экран с данными клиента → «Подтвердить» (клиент создаётся
-в 1С) → сразу ввод машины (марка, модель, госномер, VIN, год; на первом шаге есть «Без машины») →
-экран «Кому и какая машина» → «Подтвердить» (машина создаётся в 1С). До подтверждений в 1С ничего не пишется.
+Сценарий «Добавить клиента»: ФИО (для юрлица — наименование организации) → телефон → адрес → экран с данными
+клиента → «Подтвердить» (клиент создаётся в 1С) → сразу ввод машины (марка, модель, госномер, VIN, год; на первом
+шаге есть «Без машины») → экран «Кому и какая машина» → «Подтвердить» (машина создаётся в 1С). До подтверждений
+в 1С ничего не пишется. Адрес: у физлица спрашивается почтовый, у юрлица — юридический, а затем отдельно почтовый
+(кнопкой «Да, совпадает» его можно скопировать из юридического). Адрес необязателен — на шаге есть «Пропустить».
 То же добавление машины запускается из «Добавить машину» и из результата поиска клиента.
 
 Справочники → «Добавить з/ч» и «Добавить название работы»: название → сверка с 1С → (похожие: список и
@@ -94,19 +98,24 @@ works_log.addHandler(_wh)
  CAR_GOS, CAR_VIN, CAR_YEAR, ZN_WORK_NAME, ZN_WORK_PICK, ZN_WORK_AMOUNT,
  CLIENT_CONFIRM, CAR_CONFIRM, CAT_NAME, CAT_CONFIRM, ZN_PART_NAME, ZN_PART_PICK, ZN_PART_QTY,
  ZN_NEW_CLIENT, ZN_NEW_PICK, ZN_NEW_NAME, ZN_NEW_PHONE, ZN_CAR_PICK, ZN_NEW_CONFIRM,
- ZN_PART_COND, ZN_PART_ARTICLE, ZN_NEW_TYPE, CAT_ARTICLE) = range(31)
+ ZN_PART_COND, ZN_PART_ARTICLE, ZN_NEW_TYPE, CAT_ARTICLE,
+ CLIENT_ADDRESS, CLIENT_POSTAL_ASK, CLIENT_POSTAL,
+ ZN_NEW_ADDRESS, ZN_NEW_POSTAL_ASK, ZN_NEW_POSTAL) = range(37)
 
 VIN_RE = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
 CANCEL = ("✖️ Отмена", "x:cancel")
 SKIP = ("⏭ Пропустить", "x:skip")
 SKIP_CAR = ("⏭ Без машины", "x:skip")
 OK = ("✅ Подтвердить", "x:ok")
+POSTAL_SAME = ("✅ Да, совпадает", "pa:yes")
+POSTAL_OTHER = ("✏️ Нет, другой", "pa:no")
 FLOW_KEYS = ('client_name', 'phone', 'client', 'candidates', 'brand', 'model', 'gos', 'vin', 'year',
              'after_client', 'cat', 'cat_name', 'work_id', 'work_name', 'new_work', 'new_work_candidate', 'work_options',
              'part_id', 'part_name', 'new_part', 'new_part_candidate', 'part_options',
              'part_used', 'part_article', 'part_name_typed', 'new_part_article',
              'zn_flow', 'zn_query', 'zn_new_client', 'zn_car', 'client_cars', 'new_car',
-             'client_legal', 'zn_legal', 'cat_article')
+             'client_legal', 'zn_legal', 'cat_article',
+             'legal_address', 'postal_address')
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -386,9 +395,19 @@ class AutoServiceBot:
         if data == "x:skip":
             step = {CLIENT_PHONE: self._client_phone, CAR_VIN: self._car_vin, CAR_YEAR: self._car_year,
                     CAR_BRAND: self._skip_car, ZN_NEW_PHONE: self._zn_new_phone,
+                    CLIENT_ADDRESS: self._client_address, CLIENT_POSTAL: self._client_postal,
+                    ZN_NEW_ADDRESS: self._zn_new_address, ZN_NEW_POSTAL: self._zn_new_postal,
                     ZN_PART_ARTICLE: self._zn_part_article, CAT_ARTICLE: self._cat_article}.get(d.get('state'))
             if step:
                 return await step(update, context, "")
+            return await self.route(update, context, "m:main")
+
+        if data in ("pa:yes", "pa:no"):
+            same = data == "pa:yes"
+            if d.get('state') == ZN_NEW_POSTAL_ASK:
+                return await self._zn_new_postal_choice(update, context, same)
+            if d.get('state') == CLIENT_POSTAL_ASK:
+                return await self._client_postal_choice(update, context, same)
             return await self.route(update, context, "m:main")
 
         if data == "x:ok":
@@ -865,10 +884,60 @@ class AutoServiceBot:
         return await self._zn_new_phone(update, context, update.message.text.strip())
 
     async def _zn_new_phone(self, update, context, phone: str):
-        """Запоминает телефон нового клиента (клиент пока не создаётся) и переходит к вводу его машины."""
+        """Запоминает телефон нового клиента и спрашивает адрес (юрлицу — юридический, затем почтовый)."""
         await self.drop_prompt(context)
-        context.user_data['zn_new_client']['phone'] = phone[:50]
-        return await self.zn_new_car(update, context, f"Новый клиент: {context.user_data['zn_new_client']['name']}\n")
+        d = context.user_data
+        nc = d['zn_new_client']
+        nc['phone'] = phone[:50]
+        if nc.get('legal'):
+            return await self.ask(update, context,
+                                  f"Новый клиент: {nc['name']}\n"
+                                  "Юридический адрес организации (можно пропустить):",
+                                  kb([SKIP, CANCEL]), ZN_NEW_ADDRESS, "m:orders")
+        return await self.ask(update, context,
+                              f"Новый клиент: {nc['name']}\nПочтовый адрес клиента (можно пропустить):",
+                              kb([SKIP, CANCEL]), ZN_NEW_ADDRESS, "m:orders")
+
+    async def handle_zn_new_address(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «адрес нового клиента» при создании ЗН (текстом): передаёт значение в _zn_new_address."""
+        return await self._zn_new_address(update, context, update.message.text.strip())
+
+    async def _zn_new_address(self, update, context, address: str):
+        """Принимает адрес нового клиента: юрлицу — юридический (и спрашивает про почтовый),
+        физлицу — почтовый. После адреса переходит к вводу машины."""
+        await self.drop_prompt(context)
+        nc = context.user_data['zn_new_client']
+        address = address[:200]
+        if nc.get('legal'):
+            nc['legal_address'] = address
+            return await self.ask(update, context,
+                                  f"Новый клиент: {nc['name']}\n🏠 Юридический адрес: {address or 'не указан'}\n\n"
+                                  "Почтовый адрес совпадает с юридическим?",
+                                  kb([POSTAL_SAME, POSTAL_OTHER], [CANCEL]), ZN_NEW_POSTAL_ASK, "m:orders")
+        nc['postal_address'] = address
+        return await self.zn_new_car(update, context, f"Новый клиент: {nc['name']}\n")
+
+    async def _zn_new_postal_choice(self, update, context, same: bool):
+        """Кнопки «почтовый адрес совпадает?» при создании ЗН: да — копируем юридический, нет — вводим почтовый."""
+        await self.drop_prompt(context)
+        nc = context.user_data['zn_new_client']
+        if same:
+            nc['postal_address'] = nc.get('legal_address', '')
+            return await self.zn_new_car(update, context, f"Новый клиент: {nc['name']}\n")
+        return await self.ask(update, context,
+                              f"Новый клиент: {nc['name']}\nПочтовый адрес (можно пропустить):",
+                              kb([SKIP, CANCEL]), ZN_NEW_POSTAL, "m:orders")
+
+    async def handle_zn_new_postal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «почтовый адрес нового клиента» (текстом): передаёт значение в _zn_new_postal."""
+        return await self._zn_new_postal(update, context, update.message.text.strip())
+
+    async def _zn_new_postal(self, update, context, address: str):
+        """Запоминает почтовый адрес нового клиента и переходит к вводу машины."""
+        await self.drop_prompt(context)
+        nc = context.user_data['zn_new_client']
+        nc['postal_address'] = address[:200]
+        return await self.zn_new_car(update, context, f"Новый клиент: {nc['name']}\n")
 
     async def zn_pick_client(self, update, context, client):
         """Клиент выбран из найденных: показывает его машины кнопками и «Новая машина»; если машин нет —
@@ -913,8 +982,13 @@ class AutoServiceBot:
         new_client, client = d.get('zn_new_client'), d.get('client')
         if new_client:
             kind = "юр. лицо" if new_client.get('legal') else "физ. лицо"
+            extra = []
+            if new_client.get('phone'):
+                extra.append(new_client['phone'])
+            if new_client.get('postal_address'):
+                extra.append(f"адрес: {new_client['postal_address']}")
             who = (f"{new_client['name']} (новый клиент, {kind}"
-                   + (f", {new_client['phone']}" if new_client['phone'] else "") + ")")
+                   + (", " + ", ".join(extra) if extra else "") + ")")
         else:
             who = client['name']
         new_car = d.get('new_car')
@@ -1017,18 +1091,76 @@ class AutoServiceBot:
         return await self._client_phone(update, context, update.message.text.strip())
 
     async def _client_phone(self, update, context, phone: str):
-        """Принимает телефон и показывает данные клиента на подтверждение (в 1С пока ничего не пишется).
+        """Принимает телефон и спрашивает адрес клиента.
 
         Параметры: phone — телефон или пустая строка (кнопка «Пропустить»).
-        Следующий шаг — кнопка «Подтвердить» (_client_commit) или «Отмена».
+        Для физлица спрашивается почтовый адрес, для юрлица — юридический (затем отдельно почтовый).
         """
         await self.drop_prompt(context)
         d = context.user_data
         d['phone'] = phone[:50]
+        if d.get('client_legal'):
+            return await self.ask(update, context, "Юридический адрес организации (можно пропустить):",
+                                  kb([SKIP, CANCEL]), CLIENT_ADDRESS, "m:clients")
+        return await self.ask(update, context, "Почтовый адрес клиента (можно пропустить):",
+                              kb([SKIP, CANCEL]), CLIENT_ADDRESS, "m:clients")
+
+    async def handle_client_address(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «адрес клиента» (текстом): передаёт значение в _client_address."""
+        return await self._client_address(update, context, update.message.text.strip())
+
+    async def _client_address(self, update, context, address: str):
+        """Принимает адрес: для юрлица — юридический (и спрашивает, совпадает ли почтовый),
+        для физлица — почтовый, после чего показывает данные на подтверждение.
+
+        Параметры: address — адрес в свободной форме или пустая строка (кнопка «Пропустить»).
+        """
+        await self.drop_prompt(context)
+        d = context.user_data
+        address = address[:200]
+        if d.get('client_legal'):
+            d['legal_address'] = address
+            return await self.ask(update, context,
+                                  f"🏠 Юридический адрес: {address or 'не указан'}\n\n"
+                                  "Почтовый адрес совпадает с юридическим?",
+                                  kb([POSTAL_SAME, POSTAL_OTHER], [CANCEL]), CLIENT_POSTAL_ASK, "m:clients")
+        d['postal_address'] = address
+        return await self._client_confirm(update, context)
+
+    async def _client_postal_choice(self, update, context, same: bool):
+        """Кнопки «почтовый адрес совпадает?» для юрлица: да — копируем юридический, нет — вводим почтовый."""
+        await self.drop_prompt(context)
+        d = context.user_data
+        if same:
+            d['postal_address'] = d.get('legal_address', '')
+            return await self._client_confirm(update, context)
+        return await self.ask(update, context, "Почтовый адрес (можно пропустить):",
+                              kb([SKIP, CANCEL]), CLIENT_POSTAL, "m:clients")
+
+    async def handle_client_postal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Шаг «почтовый адрес клиента» (текстом): передаёт значение в _client_postal."""
+        return await self._client_postal(update, context, update.message.text.strip())
+
+    async def _client_postal(self, update, context, address: str):
+        """Запоминает почтовый адрес (юрлицо, отличный от юридического) и показывает данные на подтверждение."""
+        await self.drop_prompt(context)
+        context.user_data['postal_address'] = address[:200]
+        return await self._client_confirm(update, context)
+
+    async def _client_confirm(self, update, context):
+        """Показывает данные нового клиента (ФИО, телефон, адреса) и кнопку «Подтвердить».
+        В 1С до подтверждения ничего не пишется (см. _client_commit)."""
+        d = context.user_data
         kind = "юридическое лицо" if d.get('client_legal') else "физическое лицо"
-        text = (f"Проверьте данные нового клиента:\n\n{'🏢' if d.get('client_legal') else '👤'} {d['client_name']} ({kind})\n"
-                f"☎️ {d['phone'] or 'телефон не указан'}\n\nСоздать клиента в 1С?")
-        return await self.ask(update, context, text, kb([OK, CANCEL]), CLIENT_CONFIRM, "m:clients")
+        lines = ["Проверьте данные нового клиента:", "",
+                 f"{'🏢' if d.get('client_legal') else '👤'} {d['client_name']} ({kind})",
+                 f"☎️ {d.get('phone') or 'телефон не указан'}"]
+        if d.get('legal_address'):
+            lines.append(f"🏠 Юридический адрес: {d['legal_address']}")
+        if d.get('postal_address'):
+            lines.append(f"📮 Почтовый адрес: {d['postal_address']}")
+        lines += ["", "Создать клиента в 1С?"]
+        return await self.ask(update, context, "\n".join(lines), kb([OK, CANCEL]), CLIENT_CONFIRM, "m:clients")
 
     async def _client_commit(self, update, context):
         """Подтверждение клиента: создаёт его в 1С (OneC.add_client) и сразу переходит к вводу машины.
@@ -1038,7 +1170,9 @@ class AutoServiceBot:
         """
         d = context.user_data
         try:
-            res = self.one_c.add_client(d['client_name'], d['phone'], legal=d.get('client_legal', False))
+            res = self.one_c.add_client(d['client_name'], d['phone'], legal=d.get('client_legal', False),
+                                        legal_address=d.get('legal_address', ''),
+                                        postal_address=d.get('postal_address', ''))
         except OneCError as e:
             await self.drop_prompt(context)
             return await self.done(update, context, f"❌ {e}")
@@ -1048,7 +1182,7 @@ class AutoServiceBot:
         else:
             head = f"Клиент «{res['name']}» уже есть в 1С."
         client = {"id": res["id"], "name": res["name"], "phone": res["phone"]}
-        for key in ('client_name', 'phone', 'client_legal'):
+        for key in ('client_name', 'phone', 'client_legal', 'legal_address', 'postal_address'):
             d.pop(key, None)
         return await self.choose_client(update, context, client, head=head, optional=True)
 
@@ -1326,6 +1460,9 @@ class AutoServiceBot:
                 SEARCH: st(self.handle_search),
                 CLIENT_NAME: st(self.handle_client_name),
                 CLIENT_PHONE: st(self.handle_client_phone),
+                CLIENT_ADDRESS: st(self.handle_client_address),
+                CLIENT_POSTAL_ASK: st(self.pick_by_button),
+                CLIENT_POSTAL: st(self.handle_client_postal),
                 CAR_SEARCH: st(self.handle_car_search),
                 CAR_PICK: st(self.pick_by_button),
                 CAR_BRAND: st(self.handle_car_brand),
@@ -1343,6 +1480,9 @@ class AutoServiceBot:
                 ZN_NEW_TYPE: st(self.pick_by_button),
                 ZN_NEW_NAME: st(self.handle_zn_new_name),
                 ZN_NEW_PHONE: st(self.handle_zn_new_phone),
+                ZN_NEW_ADDRESS: st(self.handle_zn_new_address),
+                ZN_NEW_POSTAL_ASK: st(self.pick_by_button),
+                ZN_NEW_POSTAL: st(self.handle_zn_new_postal),
                 ZN_CAR_PICK: st(self.pick_by_button),
                 ZN_NEW_CONFIRM: st(self.pick_by_button),
                 ZN_PART_COND: st(self.pick_by_button),

@@ -941,7 +941,8 @@ class OneC:
         Параметры (клиент: одно из двух, машина: одно из двух):
             client_id: идентификатор существующего клиента; либо
             new_client: {"name": ФИО или наименование организации, "phone": телефон, "legal": True для
-                юридического лица} — клиент будет создан.
+                юридического лица, "legal_address" и "postal_address" — адреса (необязательно)} —
+                клиент будет создан.
             car_id: идентификатор существующего автомобиля клиента; либо
             new_car: {"brand", "model", "gos", "vin", "year"} — машина будет создана и привязана к клиенту.
 
@@ -959,8 +960,11 @@ class OneC:
             self.c.НачатьТранзакцию()
             try:
                 if new_client:
-                    client_id = self.add_client(new_client["name"], new_client.get("phone", ""),
-                                                legal=new_client.get("legal", False))["id"]
+                    client_id = self.add_client(
+                        new_client["name"], new_client.get("phone", ""),
+                        legal=new_client.get("legal", False),
+                        legal_address=new_client.get("legal_address", ""),
+                        postal_address=new_client.get("postal_address", ""))["id"]
                 client_ref = self._ref("Контрагенты", client_id)
                 if new_car:
                     created = self.add_car(client_id, new_car["brand"], new_car["model"], new_car["gos"],
@@ -1108,7 +1112,8 @@ class OneC:
 
     # ---------- запись ----------
 
-    def add_client(self, full_name: str, phone: str = "", legal: bool = False) -> Dict:
+    def add_client(self, full_name: str, phone: str = "", legal: bool = False,
+                   legal_address: str = "", postal_address: str = "") -> Dict:
         """Создаёт клиента в справочнике «Контрагенты».
 
         Параметры:
@@ -1120,6 +1125,10 @@ class OneC:
             phone: телефон, может быть пустым. Если в нём не меньше 5 цифр, номер сохраняется только цифрами
                 (как это делает 1С) и записывается в «Основной телефон» и в контактную информацию клиента
                 (см. _set_client_phone); иначе в «Основной телефон» кладётся текст как есть.
+            legal_address: юридический адрес организации (обычно только для юрлица), может быть пустым.
+            postal_address: почтовый адрес, может быть пустым. Оба адреса пишутся в контактную информацию
+                клиента как тип «Адрес» с видами «Юридический адрес» и «Почтовый адрес» (см.
+                _set_client_address).
 
         Клиент создаётся в группе справочника: «Физ. лица» (для физлица) или «Юр. лица» (для юрлица);
         группы создаются автоматически, если их ещё нет.
@@ -1128,11 +1137,13 @@ class OneC:
         на обработку персональных данных «Спрашивать» и ФИО. Если клиент с таким именем уже есть
         (без учёта регистра), ничего не создаётся.
 
-        Возвращает {"id", "name", "phone", "created": True/False}.
+        Возвращает {"id", "name", "phone", "legal_address", "postal_address", "created": True/False}.
         Исключение: OneCError при отказе 1С или ошибке связи.
         """
         self._ensure()
         full_name = " ".join(full_name.split())
+        legal_address = " ".join(legal_address.split())
+        postal_address = " ".join(postal_address.split())
         digits = re.sub(r"\D", "", phone)
         if len(digits) >= 5:
             phone = digits
@@ -1162,6 +1173,10 @@ class OneC:
                 self._write(obj, "клиент")
                 if len(digits) >= 5:
                     self._set_client_phone(obj.Ссылка, digits)
+                if legal_address:
+                    self._set_client_address(obj.Ссылка, self.ADDRESS_KIND_LEGAL, legal_address)
+                if postal_address:
+                    self._set_client_address(obj.Ссылка, self.ADDRESS_KIND_POSTAL, postal_address)
                 self.c.ЗафиксироватьТранзакцию()
             except Exception:
                 self.c.ОтменитьТранзакцию()
@@ -1171,7 +1186,8 @@ class OneC:
             logger.error("Ошибка добавления клиента: %s", e)
             raise OneCError("Ошибка связи с 1С при добавлении клиента.")
         logger.info("Добавлен клиент (%s): %s", "юр. лицо" if legal else "физ. лицо", full_name)
-        return {"id": self._ref_id(obj.Ссылка), "name": obj.Наименование, "phone": phone, "created": True}
+        return {"id": self._ref_id(obj.Ссылка), "name": obj.Наименование, "phone": phone,
+                "legal_address": legal_address, "postal_address": postal_address, "created": True}
 
     CLIENT_GROUP_INDIVIDUAL = "Физ. лица"
     CLIENT_GROUP_LEGAL = "Юр. лица"
@@ -1217,6 +1233,37 @@ class OneC:
         rec.Представление = digits
         rec.CRM_ПолеХраненияНомера = float("1" + digits[-10:])
         self._write(rec, "телефон клиента")
+
+    ADDRESS_KIND_LEGAL = "Юридический адрес"
+    ADDRESS_KIND_POSTAL = "Почтовый адрес"
+
+    def _set_client_address(self, client_ref, kind_name: str, text: str):
+        """Записывает адрес клиента в регистр сведений «Контактная информация».
+
+        Адреса в базе хранятся строкой в ресурсе «Представление» при типе «Адрес» и видах «Юридический
+        адрес» / «Почтовый адрес» (см. STRUCTURE.md). Заполняются те же поля, что и формой 1С:
+        «Значение по умолчанию» и «Краткое представление».
+
+        Параметры:
+            client_ref: ссылка на контрагента.
+            kind_name: наименование вида контактной информации (ADDRESS_KIND_LEGAL / ADDRESS_KIND_POSTAL).
+            text: текст адреса в свободной форме.
+
+        Вызывается внутри транзакции add_client. Исключение: OneCError, если не найден нужный вид.
+        """
+        kind = self._first(
+            "ВЫБРАТЬ ПЕРВЫЕ 1 Вид.Ссылка КАК Ссылка ИЗ Справочник.ВидыКонтактнойИнформации КАК Вид "
+            "ГДЕ Вид.Наименование = &Н", {"Н": kind_name})
+        if kind is None:
+            raise OneCError(f"В 1С не найден вид контактной информации «{kind_name}».")
+        rec = self.c.РегистрыСведений.КонтактнаяИнформация.СоздатьМенеджерЗаписи()
+        rec.Объект = client_ref
+        rec.Тип = self.c.Перечисления.ТипыКонтактнойИнформации.Адрес
+        rec.Вид = kind
+        rec.ЗначениеПоУмолчанию = True
+        rec.КраткоеПредставление = True
+        rec.Представление = text
+        self._write(rec, "адрес клиента")
 
     def add_car(self, client_id: str, brand: str, model: str, gos_number: str,
                 vin: str = "", year: int = 0) -> Dict:
